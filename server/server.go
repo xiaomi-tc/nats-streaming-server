@@ -3,6 +3,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -90,6 +91,12 @@ const (
 	natsInboxFirstChar = '_'
 	// Length of a NATS inbox
 	natsInboxLen = 29 // _INBOX.<nuid: 22 characters>
+
+	// Name of channel the server posts events about creation/deletion of channels
+	newOrDeleteChannelName = "_SYS.streaming.channels"
+
+	// Number os system channels
+	serverNumSysChannels = 1
 )
 
 // Constant to indicate that sendMsgToSub() should check number of acks pending
@@ -228,20 +235,31 @@ func (cs *channelStore) get(name string) *channel {
 
 func (cs *channelStore) createChannel(s *StanServer, name string) (*channel, error) {
 	cs.Lock()
-	defer cs.Unlock()
 	// It is possible that there were 2 concurrent calls to lookupOrCreateChannel
 	// which first uses `channelStore.get()` and if not found, calls this function.
 	// So we need to check now that we have the write lock that the channel has
 	// not already been created.
 	c := cs.channels[name]
 	if c != nil {
+		cs.Unlock()
 		return c, nil
 	}
 	sc, err := cs.store.CreateChannel(name)
 	if err != nil {
+		cs.Unlock()
 		return nil, err
 	}
-	return cs.create(s, name, sc), nil
+	c = cs.create(s, name, sc)
+	cs.Unlock()
+	// Will be nil in partitioning mode
+	if name != newOrDeleteChannelName && s.newOrDeleteChannel != nil {
+		// Add an event in the newOrDeleteChannel and send to (possible) subscriptions
+		co := &channelOperation{New: true, Name: name}
+		b, _ := json.Marshal(co)
+		s.newOrDeleteChannel.store.Msgs.Store(b)
+		s.processMsg(s.newOrDeleteChannel)
+	}
+	return c, nil
 }
 
 // low-level creation and storage in memory of a *channel
@@ -249,6 +267,9 @@ func (cs *channelStore) createChannel(s *StanServer, name string) (*channel, err
 func (cs *channelStore) create(s *StanServer, name string, sc *stores.Channel) *channel {
 	c := &channel{name: name, store: sc, ss: s.createSubStore()}
 	cs.channels[name] = c
+	if name == newOrDeleteChannelName {
+		s.newOrDeleteChannel = c
+	}
 	return c
 }
 
@@ -340,6 +361,10 @@ type StanServer struct {
 	// Store
 	store stores.Store
 
+	// Reference to the system channel to which new or deleted channels
+	// events are posted.
+	newOrDeleteChannel *channel
+
 	// Monitoring
 	monMu   sync.RWMutex
 	numSubs int
@@ -399,6 +424,12 @@ type StanServer struct {
 	trace bool
 	debug bool
 	log   *logger.StanLogger
+}
+
+// channelOperation indicates which message was created or deleted
+type channelOperation struct {
+	New  bool   `json:"new"`
+	Name string `json:"name"`
 }
 
 // subStore holds all known state for all subscriptions
@@ -1280,6 +1311,13 @@ func (s *StanServer) start(runningState State) error {
 			return err
 		}
 	}
+	// Create the system channel that server stores info about new (or deleted) channels.
+	// We can't be using that when running in partitioning mode
+	if s.partitions == nil {
+		if _, err := s.lookupOrCreateChannel(newOrDeleteChannelName); err != nil {
+			return err
+		}
+	}
 
 	// Start the go-routine responsible to start sending messages to newly
 	// started subscriptions. We do that before opening the gates in
@@ -2105,6 +2143,14 @@ func (s *StanServer) processClientPublish(m *nats.Msg) {
 			return
 		}
 		// else we will report an error below...
+	}
+	// Disallow publish to _SYS.>, these are reserved for internals.
+	if len(pm.Subject) > 5 && pm.Subject[0] == '_' &&
+		pm.Subject[1] == 'S' && pm.Subject[2] == 'Y' &&
+		pm.Subject[3] == 'S' && pm.Subject[4] == '.' {
+		s.log.Errorf("Reserved subject, rejecting publish on %v", pm.Subject)
+		s.sendPublishErr(m.Reply, pm.Guid, ErrInvalidSubject)
+		return
 	}
 
 	// Make sure we have a clientID, guid, etc.
@@ -3093,7 +3139,7 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 	// Grab channel state, create a new one if needed.
 	c, err := s.lookupOrCreateChannel(sr.Subject)
 	if err != nil {
-		s.log.Errorf("Unable to create store for subject %s", sr.Subject)
+		s.log.Errorf("Unable to create channel for subject %s", sr.Subject)
 		s.sendSubscriptionResponseErr(m.Reply, err)
 		return
 	}

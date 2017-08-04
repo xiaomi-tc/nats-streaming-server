@@ -85,6 +85,15 @@ func monitorExpectInternalError(t *testing.T, endpoint string) {
 	}
 }
 
+func discardSysChannelsCounts(t *testing.T, s *StanServer, numChannels, numMsgs int, numBytes uint64) (int, int, uint64) {
+	c := channelsGet(t, s.channels, newOrDeleteChannelName)
+	m, b, err := c.store.Msgs.State()
+	if err != nil {
+		stackFatalf(t, "Error getting messages state: %v", err)
+	}
+	return numChannels - 1, numMsgs - m, numBytes - b
+}
+
 func TestMonitorUseEmbeddedNATSServer(t *testing.T) {
 	resetPreviousHTTPConnections()
 	s := runMonitorServer(t, GetDefaultOptions())
@@ -212,17 +221,18 @@ func TestMonitorServerz(t *testing.T) {
 	if sz.Clients != 1 {
 		t.Fatalf("Expected 1 client, got %v", sz.Clients)
 	}
-	if sz.Channels != 1 {
-		t.Fatalf("Expected 1 channel, got %v", sz.Channels)
+	channelsCount, msgsCount, bytesCount := discardSysChannelsCounts(t, s, sz.Channels, sz.TotalMsgs, sz.TotalBytes)
+	if channelsCount != 1 {
+		t.Fatalf("Expected 1 channel, got %v", channelsCount)
 	}
 	if sz.Subscriptions != 1 {
 		t.Fatalf("Expected 1 subscription, got %v", sz.Subscriptions)
 	}
-	if sz.TotalMsgs != totalMsgs {
-		t.Fatalf("Expected %d messages, got %v", totalMsgs, sz.TotalMsgs)
+	if msgsCount != totalMsgs {
+		t.Fatalf("Expected %d messages, got %v", totalMsgs, msgsCount)
 	}
-	if sz.TotalBytes != totalBytes {
-		t.Fatalf("Expected %v bytes, got %v", totalBytes, sz.TotalBytes)
+	if bytesCount != totalBytes {
+		t.Fatalf("Expected %v bytes, got %v", totalBytes, bytesCount)
 	}
 	resp.Body.Close()
 
@@ -239,17 +249,18 @@ func TestMonitorServerz(t *testing.T) {
 	if sz.Clients != 1 {
 		t.Fatalf("Expected 1 client, got %v", sz.Clients)
 	}
-	if sz.Channels != 1 {
-		t.Fatalf("Expected 1 channel, got %v", sz.Channels)
+	channelsCount, msgsCount, bytesCount = discardSysChannelsCounts(t, s, sz.Channels, sz.TotalMsgs, sz.TotalBytes)
+	if channelsCount != 1 {
+		t.Fatalf("Expected 1 channel, got %v", channelsCount)
 	}
 	if sz.Subscriptions != 0 {
 		t.Fatalf("Expected 0 subscription, got %v", sz.Subscriptions)
 	}
-	if sz.TotalMsgs != totalMsgs {
-		t.Fatalf("Expected %d messages, got %v", totalMsgs, sz.TotalMsgs)
+	if msgsCount != totalMsgs {
+		t.Fatalf("Expected %d messages, got %v", totalMsgs, msgsCount)
 	}
-	if sz.TotalBytes != totalBytes {
-		t.Fatalf("Expected %v bytes, got %v", totalBytes, sz.TotalBytes)
+	if bytesCount != totalBytes {
+		t.Fatalf("Expected %v bytes, got %v", totalBytes, bytesCount)
 	}
 	resp.Body.Close()
 
@@ -266,17 +277,18 @@ func TestMonitorServerz(t *testing.T) {
 	if sz.Clients != 0 {
 		t.Fatalf("Expected 0 client, got %v", sz.Clients)
 	}
-	if sz.Channels != 1 {
-		t.Fatalf("Expected 1 channel, got %v", sz.Channels)
+	channelsCount, msgsCount, bytesCount = discardSysChannelsCounts(t, s, sz.Channels, sz.TotalMsgs, sz.TotalBytes)
+	if channelsCount != 1 {
+		t.Fatalf("Expected 1 channel, got %v", channelsCount)
 	}
 	if sz.Subscriptions != 0 {
 		t.Fatalf("Expected 0 subscription, got %v", sz.Subscriptions)
 	}
-	if sz.TotalMsgs != totalMsgs {
-		t.Fatalf("Expected %d messages, got %v", totalMsgs, sz.TotalMsgs)
+	if msgsCount != totalMsgs {
+		t.Fatalf("Expected %d messages, got %v", totalMsgs, msgsCount)
 	}
-	if sz.TotalBytes != totalBytes {
-		t.Fatalf("Expected %v bytes, got %v", totalBytes, sz.TotalBytes)
+	if bytesCount != totalBytes {
+		t.Fatalf("Expected %v bytes, got %v", totalBytes, bytesCount)
 	}
 	resp.Body.Close()
 
@@ -324,17 +336,18 @@ func TestMonitorServerz(t *testing.T) {
 	if sz.Clients != 0 {
 		t.Fatalf("Expected 0 client, got %v", sz.Clients)
 	}
-	if sz.Channels != 0 {
-		t.Fatalf("Expected 0 channel, got %v", sz.Channels)
+	channelsCount, msgsCount, bytesCount = discardSysChannelsCounts(t, s, sz.Channels, sz.TotalMsgs, sz.TotalBytes)
+	if channelsCount != 0 {
+		t.Fatalf("Expected 0 channel, got %v", channelsCount)
 	}
 	if sz.Subscriptions != 0 {
 		t.Fatalf("Expected 0 subscription, got %v", sz.Subscriptions)
 	}
-	if sz.TotalMsgs != 0 {
-		t.Fatalf("Expected 0 message, got %v", sz.TotalMsgs)
+	if msgsCount != 0 {
+		t.Fatalf("Expected 0 message, got %v", msgsCount)
 	}
-	if sz.TotalBytes > 0 {
-		t.Fatalf("Expected 0 bytes, got %v", sz.TotalBytes)
+	if bytesCount > 0 {
+		t.Fatalf("Expected 0 bytes, got %v", bytesCount)
 	}
 
 	// Produce store failure
@@ -429,17 +442,18 @@ func TestMonitorServerzAfterRestart(t *testing.T) {
 		if sz.Clients != 1 {
 			t.Fatalf("Expected 1 client, got %v", sz.Clients)
 		}
-		if sz.Channels != 1 {
-			t.Fatalf("Expected 1 channel, got %v", sz.Channels)
+		channelsCount, msgsCount, bytesCount := discardSysChannelsCounts(t, s, sz.Channels, sz.TotalMsgs, sz.TotalBytes)
+		if channelsCount != 1 {
+			t.Fatalf("Expected 1 channel, got %v", channelsCount)
 		}
 		if sz.Subscriptions != 1 {
 			t.Fatalf("Expected 1 subscription, got %v", sz.Subscriptions)
 		}
-		if sz.TotalMsgs != totalMsgs {
-			t.Fatalf("Expected %d messages, got %v", totalMsgs, sz.TotalMsgs)
+		if msgsCount != totalMsgs {
+			t.Fatalf("Expected %d messages, got %v", totalMsgs, msgsCount)
 		}
-		if sz.TotalBytes != totalBytes {
-			t.Fatalf("Expected %v bytes, got %v", totalBytes, sz.TotalBytes)
+		if bytesCount != totalBytes {
+			t.Fatalf("Expected %v bytes, got %v", totalBytes, bytesCount)
 		}
 		resp.Body.Close()
 
@@ -492,11 +506,12 @@ func TestMonitorStorez(t *testing.T) {
 			if !reflect.DeepEqual(sz.Limits, s.opts.StoreLimits) {
 				t.Fatalf("Expected Limits to be %v, got %v", s.opts.StoreLimits, sz.Limits)
 			}
-			if sz.TotalMsgs != expectedTotalMsgs {
-				t.Fatalf("Expected TotalMsgs to be %v, got %v", expectedTotalMsgs, sz.TotalMsgs)
+			_, msgsCount, bytesCount := discardSysChannelsCounts(t, s, 0, sz.TotalMsgs, sz.TotalBytes)
+			if msgsCount != expectedTotalMsgs {
+				t.Fatalf("Expected TotalMsgs to be %v, got %v", expectedTotalMsgs, msgsCount)
 			}
-			if sz.TotalBytes != expectedTotalBytes {
-				t.Fatalf("Expected TotalMsgs to be %v, got %v", expectedTotalBytes, sz.TotalBytes)
+			if bytesCount != expectedTotalBytes {
+				t.Fatalf("Expected TotalMsgs to be %v, got %v", expectedTotalBytes, bytesCount)
 			}
 			resp.Body.Close()
 
@@ -787,7 +802,7 @@ func TestMonitorChannelsz(t *testing.T) {
 	s := runMonitorServer(t, GetDefaultOptions())
 	defer s.Shutdown()
 
-	channels := []string{"bar", "baz", "foo", "foo.bar"}
+	channels := []string{newOrDeleteChannelName, "bar", "baz", "foo", "foo.bar"}
 	totalChannels := len(channels)
 	for _, c := range channels {
 		if _, err := s.lookupOrCreateChannel(c); err != nil {
@@ -862,7 +877,7 @@ func TestMonitorChannelsWithSubsz(t *testing.T) {
 	sc := NewDefaultConnection(t)
 	defer sc.Close()
 
-	channels := []string{"bar", "baz", "foo", "foo.bar"}
+	channels := []string{newOrDeleteChannelName, "bar", "baz", "foo", "foo.bar"}
 	totalChannels := len(channels)
 
 	totalSubs := 0
@@ -1124,10 +1139,15 @@ func TestMonitorDurableSubs(t *testing.T) {
 				if err := json.Unmarshal(body, channels); err != nil {
 					stackFatalf(t, "Error unmarshalling: %v", err)
 				}
-				if len(channels.Channels) != 1 {
-					stackFatalf(t, "Expected a single channel, got %v", len(channels.Channels))
+				if len(channels.Channels) != 1+serverNumSysChannels {
+					stackFatalf(t, "Unexpected number of channels: %v", len(channels.Channels))
 				}
-				channel = channels.Channels[0]
+				for _, v := range channels.Channels {
+					if v.Name != newOrDeleteChannelName {
+						channel = v
+						break
+					}
+				}
 			} else {
 				resp, body := getBody(t, ChannelsPath+"?channel=foo&subs=1", expectedJSON)
 				defer resp.Body.Close()

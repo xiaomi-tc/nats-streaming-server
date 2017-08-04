@@ -3,6 +3,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -1291,4 +1292,85 @@ func TestAckForUnknownChannel(t *testing.T) {
 	if !gotIt {
 		t.Fatalf("Server did not log error about not finding channel")
 	}
+}
+
+func TestNewChannelNotification(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	opts := getTestDefaultOptsForPersistentStore()
+	s := runServerWithOpts(t, opts, nil)
+	defer shutdownRestartedServerOnTestExit(&s)
+
+	sc, nc := createConnectionWithNatsOpts(t, clientName, nats.ReconnectWait(50*time.Millisecond))
+	defer nc.Close()
+	defer sc.Close()
+
+	// Make sure we can't publish to the special channel
+	if err := sc.Publish(newOrDeleteChannelName, []byte("msg")); err == nil {
+		t.Fatal("Expected error on publish, got none")
+	}
+
+	ch := make(chan string)
+	cb := func(m *stan.Msg) {
+		co := &channelOperation{}
+		if err := json.Unmarshal(m.Data, co); err != nil {
+			t.Fatalf("Error on unmarshal: %v", err)
+		}
+		if !co.New {
+			t.Fatal("Expected New to be true")
+		}
+		ch <- co.Name
+	}
+
+	shouldNotGet := func() {
+		select {
+		case n := <-ch:
+			stackFatalf(t, "Should not have received notification about new channel: %v", n)
+		case <-time.After(100 * time.Millisecond):
+			return
+		}
+	}
+	shouldGet := func(name string) {
+		select {
+		case n := <-ch:
+			if n != name {
+				t.Fatalf("Expected channel %q, got %q", name, n)
+			}
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("Should have received notification")
+		}
+	}
+
+	if _, err := sc.Subscribe(newOrDeleteChannelName, cb,
+		stan.DeliverAllAvailable(),
+		stan.DurableName("dur")); err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	shouldNotGet()
+
+	// Create the channel
+	if err := sc.Publish("foo", []byte("msg")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+	// Now we should receive a notification
+	shouldGet("foo")
+	// Send a new message on same channel
+	if err := sc.Publish("foo", []byte("msg")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+	// no new channel, so should not get
+	shouldNotGet()
+
+	// Restart the server
+	s.Shutdown()
+	s = runServerWithOpts(t, opts, nil)
+	// No notification should be sent
+	shouldNotGet()
+	// New channel
+	if err := sc.Publish("bar", []byte("msg")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+	// Should get notified
+	shouldGet("bar")
 }

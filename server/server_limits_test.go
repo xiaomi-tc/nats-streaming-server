@@ -14,7 +14,7 @@ import (
 func TestTooManyChannelsOnCreateSub(t *testing.T) {
 	sOpts := GetDefaultOptions()
 	sOpts.ID = clusterName
-	sOpts.MaxChannels = 1
+	sOpts.MaxChannels = 1 + serverNumSysChannels
 	s := runServerWithOpts(t, sOpts, nil)
 	defer s.Shutdown()
 
@@ -35,7 +35,7 @@ func TestTooManyChannelsOnCreateSub(t *testing.T) {
 func TestTooManyChannelsOnPublish(t *testing.T) {
 	sOpts := GetDefaultOptions()
 	sOpts.ID = clusterName
-	sOpts.MaxChannels = 1
+	sOpts.MaxChannels = 1 + serverNumSysChannels
 	s := runServerWithOpts(t, sOpts, nil)
 	defer s.Shutdown()
 
@@ -358,7 +358,7 @@ func TestPerChannelLimits(t *testing.T) {
 
 func TestUnlimitedPerChannelLimits(t *testing.T) {
 	opts := GetDefaultOptions()
-	opts.StoreLimits.MaxChannels = 2
+	opts.StoreLimits.MaxChannels = 2 + serverNumSysChannels
 	// Set very small global limits
 	opts.StoreLimits.MaxMsgs = 1
 	opts.StoreLimits.MaxBytes = 1
