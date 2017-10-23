@@ -693,7 +693,7 @@ func closeSubscriber(t *testing.T, subType string) {
 	if subType == "sub" {
 		dur = ss.durables[durKey]
 	} else {
-		dur = ss.qsubs[durKey].subs[0]
+		dur = ss.qsubs[durKey].members[0]
 	}
 	s.mu.RUnlock()
 	if dur == nil {

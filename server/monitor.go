@@ -99,15 +99,15 @@ type Channelz struct {
 
 // Subscriptionz describes a NATS Streaming Subscription
 type Subscriptionz struct {
-	Inbox        string `json:"inbox"`
-	AckInbox     string `json:"ack_inbox"`
+	Inbox        string `json:"inbox,omitempty"`     // Will be empty when a durable queue group is offline
+	AckInbox     string `json:"ack_inbox,omitempty"` // Will be empty when a durable queue group is offline
 	DurableName  string `json:"durable_name,omitempty"`
 	QueueName    string `json:"queue_name,omitempty"`
 	IsDurable    bool   `json:"is_durable"`
 	IsOffline    bool   `json:"is_offline"`
 	MaxInflight  int    `json:"max_inflight"`
 	AckWait      int    `json:"ack_wait"`
-	LastSent     uint64 `json:"last_sent"`
+	LastSent     uint64 `json:"last_sent,omitempty"` // Is 0 for queue members
 	PendingCount int    `json:"pending_count"`
 	IsStalled    bool   `json:"is_stalled"`
 }
@@ -320,7 +320,19 @@ func getMonitorClientSubs(client *client) map[string][]*Subscriptionz {
 			subsz = make(map[string][]*Subscriptionz)
 		}
 		array := subsz[sub.subject]
-		newArray := append(array, createSubscriptionz(sub))
+		var subz *Subscriptionz
+		// Check if this is a queue member
+		sub.RLock()
+		qs := sub.qstate
+		sub.RUnlock()
+		if qs != nil {
+			qs.RLock()
+			subz = createQueueMemberSubscriptionz(qs, sub)
+			qs.RUnlock()
+		} else {
+			subz = createSubscriptionz(sub)
+		}
+		newArray := append(array, subz)
 		if &newArray != &array {
 			subsz[sub.subject] = newArray
 		}
@@ -341,17 +353,18 @@ func getMonitorChannelSubs(ss *subStore) []*Subscriptionz {
 			subsz = append(subsz, createSubscriptionz(sub))
 		}
 	}
-	for _, qsub := range ss.qsubs {
-		qsub.RLock()
-		for _, sub := range qsub.subs {
-			subsz = append(subsz, createSubscriptionz(sub))
+	for _, qs := range ss.qsubs {
+		qs.RLock()
+		for _, sub := range qs.members {
+			subsz = append(subsz, createQueueMemberSubscriptionz(qs, sub))
 		}
-		// If this is a durable queue subscription and all members
-		// are offline, qsub.shadow will be not nil. Report this one.
-		if qsub.shadow != nil {
-			subsz = append(subsz, createSubscriptionz(qsub.shadow))
+		// If this is a durable queue subscription and has no member,
+		// it means that this is an offline queue group.
+		// Report the group's meta sub.
+		if qs.sub.IsDurable && qs.sub.isOffline() {
+			subsz = append(subsz, createSubscriptionz(qs.sub))
 		}
-		qsub.RUnlock()
+		qs.RUnlock()
 	}
 	return subsz
 }
@@ -370,6 +383,23 @@ func createSubscriptionz(sub *subState) *Subscriptionz {
 		LastSent:     sub.LastSent,
 		PendingCount: len(sub.acksPending),
 		IsStalled:    sub.stalled,
+	}
+	sub.RUnlock()
+	return subz
+}
+
+func createQueueMemberSubscriptionz(qs *queueState, sub *subState) *Subscriptionz {
+	sub.RLock()
+	mpa := qs.memberPendingAcks[sub.ID]
+	pendingCount := len(mpa)
+	subz := &Subscriptionz{
+		Inbox:        sub.Inbox,
+		AckInbox:     sub.AckInbox,
+		QueueName:    sub.QGroup,
+		IsDurable:    sub.IsDurable,
+		MaxInflight:  int(sub.MaxInFlight),
+		AckWait:      int(sub.AckWaitInSecs),
+		PendingCount: pendingCount,
 	}
 	sub.RUnlock()
 	return subz

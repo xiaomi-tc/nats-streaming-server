@@ -252,11 +252,33 @@ func waitForAcks(t tLogger, s *StanServer, ID string, subID uint64, expected int
 	if sub == nil {
 		stackFatalf(t, "Subscription %v not found", subID)
 	}
-	waitForCount(t, 0, func() (string, int) {
+	waitForCount(t, expected, func() (string, int) {
 		sub.RLock()
 		count := len(sub.acksPending)
 		sub.RUnlock()
 		return "ack pending", count
+	})
+}
+
+func waitForQGroupAcks(t tLogger, s *StanServer, channel, group string, expected int) {
+	c := s.channels.get(channel)
+	if c == nil {
+		stackFatalf(t, "Channel %q not found", channel)
+	}
+	c.ss.RLock()
+	qs := c.ss.qsubs[group]
+	c.ss.RUnlock()
+	if qs == nil {
+		stackFatalf(t, "Queue group %q not found", group)
+	}
+	qs.RLock()
+	sub := qs.sub
+	qs.RUnlock()
+	waitForCount(t, expected, func() (string, int) {
+		sub.RLock()
+		count := len(sub.acksPending)
+		sub.RUnlock()
+		return "queue ack pending", count
 	})
 }
 
@@ -915,7 +937,7 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 
 	m := &pb.MsgProto{}
 	sub.Lock()
-	s.sendMsgToSub(sub, m, false)
+	s.sendMsgToSub(sub, sub.ID, sub.ClientID, sub.Inbox, m, false)
 	sub.Unlock()
 }
 

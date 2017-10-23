@@ -206,16 +206,33 @@ func TestQueueRedelivery(t *testing.T) {
 	}
 
 	subs := checkSubs(t, s, clientName, 1)
-	func(sub *subState) {
+	checkSub := func(sub *subState) {
 		sub.RLock()
 		defer sub.RUnlock()
-		if sub.acksPending == nil || len(sub.acksPending) != 2 {
-			t.Fatalf("Expected to have two ackPending, got %v", len(sub.acksPending))
+		if sub.acksPending != nil {
+			t.Fatalf("Expected member acksPending to be nil: %v", sub)
 		}
-		if sub.ackTimer == nil {
-			t.Fatalf("Expected timer to be set")
+		if sub.ackTimer != nil {
+			t.Fatal("Expected member timer to be nil")
 		}
-	}(subs[0])
+	}
+	checkSub(subs[0])
+	c := s.channels.get("foo")
+	c.ss.RLock()
+	qs := c.ss.qsubs["group"]
+	c.ss.RUnlock()
+	func(qs *queueState) {
+		qs.RLock()
+		defer qs.RUnlock()
+		qs.sub.RLock()
+		defer qs.sub.RUnlock()
+		if qs.sub.acksPending == nil || len(qs.sub.acksPending) != 2 {
+			t.Fatalf("Expected qsub's to have 2 pending, got %v", len(qs.sub.acksPending))
+		}
+		if qs.sub.ackTimer == nil {
+			t.Fatal("Expected qsub's timer to be set")
+		}
+	}(qs)
 
 	for i := 0; i < 2; i++ {
 		if err := Wait(rch); err != nil {
@@ -227,16 +244,19 @@ func TestQueueRedelivery(t *testing.T) {
 	time.Sleep(75 * time.Millisecond)
 
 	// Check state
-	func(sub *subState) {
-		sub.RLock()
-		defer sub.RUnlock()
-		if len(sub.acksPending) != 0 {
-			t.Fatalf("Expected to have no ackPending, got %v", len(sub.acksPending))
+	checkSub(subs[0])
+	func(qs *queueState) {
+		qs.RLock()
+		defer qs.RUnlock()
+		qs.sub.RLock()
+		defer qs.sub.RUnlock()
+		if qs.sub.acksPending == nil || len(qs.sub.acksPending) != 0 {
+			t.Fatalf("Expected qsub's to have no pending, got %v", len(qs.sub.acksPending))
 		}
-		if sub.ackTimer != nil {
-			t.Fatalf("Expected timer to be nil")
+		if qs.sub.ackTimer != nil {
+			t.Fatal("Expected qsub's timer to be nil")
 		}
-	}(subs[0])
+	}(qs)
 }
 
 func TestDurableRedelivery(t *testing.T) {
@@ -650,11 +670,12 @@ func TestPersistentStorePersistMsgRedeliveredToDifferentQSub(t *testing.T) {
 
 	// Create two queue subscribers with manual ackMode that will
 	// not ack the message.
-	if _, err := sc.QueueSubscribe("foo", "g1", cb, stan.AckWait(ackWaitInMs(15)),
+	if _, err := sc.QueueSubscribe("foo", "g1", cb,
+		stan.AckWait(ackWaitInMs(250)),
 		stan.SetManualAckMode()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
-	sub2, err = sc.QueueSubscribe("foo", "g1", cb, stan.AckWait(ackWaitInMs(150)),
+	sub2, err = sc.QueueSubscribe("foo", "g1", cb,
 		stan.SetManualAckMode())
 	if err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
@@ -668,7 +689,7 @@ func TestPersistentStorePersistMsgRedeliveredToDifferentQSub(t *testing.T) {
 	// Wait for sub2 to receive the message.
 	select {
 	case <-sub2Recv:
-		waitForAcks(t, s, clientName, 1, 0)
+		waitForQGroupAcks(t, s, "foo", "g1", 1)
 		break
 	case e := <-errs:
 		t.Fatalf("%v", e)
@@ -685,18 +706,8 @@ func TestPersistentStorePersistMsgRedeliveredToDifferentQSub(t *testing.T) {
 	if len(subs) != 2 {
 		t.Fatalf("Expected 2 subscriptions to be recovered, got %v", len(subs))
 	}
-	// Message should be in sub2's ackPending
-	for _, s := range subs {
-		s.RLock()
-		na := len(s.acksPending)
-		sID := s.ID
-		s.RUnlock()
-		if sID == 1 && na != 0 {
-			t.Fatal("Unexpected un-acknowledged message for sub1")
-		} else if sID == 2 && na != 1 {
-			t.Fatal("Unacknowledged message should have been recovered for sub2")
-		}
-	}
+	// Message should be in queue group's meta sub's ackPending
+	waitForQGroupAcks(t, s, "foo", "g1", 1)
 }
 
 func TestPersistentStoreAckMsgRedeliveredToDifferentQueueSub(t *testing.T) {
@@ -776,7 +787,7 @@ func TestPersistentStoreAckMsgRedeliveredToDifferentQueueSub(t *testing.T) {
 		t.Fatal("Did not get out message")
 	}
 	// Wait for msg sent to sub2 to be ack'ed
-	waitForAcks(t, s, clientName, 2, 0)
+	waitForQGroupAcks(t, s, "foo", "g1", 0)
 
 	// Stop server
 	s.Shutdown()
@@ -815,8 +826,8 @@ func TestDurableQueueSubRedeliveryOnRejoin(t *testing.T) {
 
 	sc := NewDefaultConnection(t)
 	defer sc.Close()
-	total := 100
-	for i := 0; i < total; i++ {
+	numberSentBeforeQSub2 := 99
+	for i := 0; i < numberSentBeforeQSub2; i++ {
 		if err := sc.Publish("foo", []byte("msg1")); err != nil {
 			t.Fatalf("Unexpected error on publish: %v", err)
 		}
@@ -826,7 +837,7 @@ func TestDurableQueueSubRedeliveryOnRejoin(t *testing.T) {
 	cb1 := func(m *stan.Msg) {
 		if !m.Redelivered {
 			dlv++
-			if dlv == total {
+			if dlv == numberSentBeforeQSub2 {
 				dch <- true
 			}
 		}
@@ -836,12 +847,12 @@ func TestDurableQueueSubRedeliveryOnRejoin(t *testing.T) {
 	sigCh := make(chan bool)
 	signaled := false
 	cb2 := func(m *stan.Msg) {
-		if m.Redelivered && int(m.Sequence) <= total {
+		if m.Redelivered && int(m.Sequence) < numberSentBeforeQSub2 {
 			rdlv++
-			if rdlv == total {
+			if rdlv == numberSentBeforeQSub2 {
 				rdch <- true
 			}
-		} else if !m.Redelivered && int(m.Sequence) > total {
+		} else if !m.Redelivered && int(m.Sequence) > numberSentBeforeQSub2 {
 			if !signaled {
 				signaled = true
 				sigCh <- true
@@ -851,8 +862,9 @@ func TestDurableQueueSubRedeliveryOnRejoin(t *testing.T) {
 	// Create a durable queue subscriber with manual ack
 	if _, err := sc.QueueSubscribe("foo", "group", cb1,
 		stan.DeliverAllAvailable(),
+		stan.MaxInflight(numberSentBeforeQSub2+1),
+		stan.AckWait(ackWaitInMs(100)),
 		stan.SetManualAckMode(),
-		stan.MaxInflight(total),
 		stan.DurableName("qsub")); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
@@ -870,9 +882,7 @@ func TestDurableQueueSubRedeliveryOnRejoin(t *testing.T) {
 	defer sc2.Close()
 	// Rejoin the group
 	if _, err := sc2.QueueSubscribe("foo", "group", cb2,
-		stan.DeliverAllAvailable(),
 		stan.SetManualAckMode(),
-		stan.AckWait(ackWaitInMs(15)),
 		stan.DurableName("qsub")); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
@@ -920,6 +930,7 @@ func TestPersistentStoreDurableQueueSubRedeliveryOnRejoin(t *testing.T) {
 	// Create a durable queue subscriber with manual ack
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
 		stan.DeliverAllAvailable(),
+		stan.AckWait(ackWaitInMs(150)),
 		stan.SetManualAckMode(),
 		stan.DurableName("qsub")); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
@@ -941,8 +952,6 @@ func TestPersistentStoreDurableQueueSubRedeliveryOnRejoin(t *testing.T) {
 	defer sc.Close()
 	// Rejoin the group
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
-		stan.DeliverAllAvailable(),
-		stan.AckWait(ackWaitInMs(15)),
 		stan.DurableName("qsub")); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
@@ -1052,7 +1061,7 @@ func TestIgnoreFailedHBInAckRedeliveryForQGroup(t *testing.T) {
 		sc1.Publish("foo", []byte("hello"))
 	}
 	// Wait for those messages to be ack'ed
-	waitForAcks(t, s, "client1", 1, 0)
+	waitForQGroupAcks(t, s, "foo", "group", 0)
 	// Close connection of sub1
 	nc.Close()
 	// Send 2 more messages
@@ -1105,57 +1114,42 @@ func TestQueueRedeliveryOnStartup(t *testing.T) {
 	totalMsgs := int32(10)
 	delivered := int32(0)
 	redelivered := int32(0)
-	type qinfo struct {
-		r    int
-		msgs map[uint64]struct{}
-	}
-	newCb := func(id int) func(m *stan.Msg) {
-		q := qinfo{msgs: make(map[uint64]struct{}, 2)}
-		return func(m *stan.Msg) {
-			if !m.Redelivered {
-				if atomic.LoadInt32(&restarted) == 0 {
-					q.msgs[m.Sequence] = struct{}{}
-					if atomic.AddInt32(&delivered, 1) == totalMsgs {
-						ch <- true
-					}
-				} else {
-					m.Ack()
-					if q.r != len(q.msgs) {
-						errCh <- fmt.Errorf("Unexpected new message %v into sub %d before getting all undelivered first", m.Sequence, id)
-					}
-				}
-			} else if atomic.LoadInt32(&restarted) == 1 {
-				// This is a redelivered message after server restart
-				if _, present := q.msgs[m.Sequence]; !present {
-					errCh <- fmt.Errorf("Unexpected message %v into sub %d", m.Sequence, id)
-				} else {
-					m.Ack()
-					q.r++
-					if atomic.AddInt32(&redelivered, 1) == totalMsgs {
-						ch <- true
-					}
+	cb := func(m *stan.Msg) {
+		if !m.Redelivered {
+			if atomic.LoadInt32(&restarted) == 0 {
+				if atomic.AddInt32(&delivered, 1) == totalMsgs {
+					ch <- true
 				}
 			} else {
-				select {
-				case skipCh <- true:
-				default:
+				m.Ack()
+				if atomic.LoadInt32(&redelivered) != totalMsgs {
+					errCh <- fmt.Errorf("Unexpected new message %v before getting all undelivered first", m.Sequence)
 				}
-				m.Sub.Unsubscribe()
 			}
+		} else if atomic.LoadInt32(&restarted) == 1 {
+			// This is a redelivered message after server restart
+			m.Ack()
+			if atomic.AddInt32(&redelivered, 1) == totalMsgs {
+				ch <- true
+			}
+		} else {
+			select {
+			case skipCh <- true:
+			default:
+			}
+			m.Sub.Unsubscribe()
 		}
 	}
 	if _, err := sc.QueueSubscribe("foo", "queue",
-		newCb(1),
-		stan.MaxInflight(int(totalMsgs/2)),
+		cb,
+		stan.MaxInflight(int(totalMsgs)),
 		stan.SetManualAckMode(),
 		stan.AckWait(ackWaitInMs(500))); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	if _, err := sc.QueueSubscribe("foo", "queue",
-		newCb(2),
-		stan.MaxInflight(int(totalMsgs/2)),
-		stan.SetManualAckMode(),
-		stan.AckWait(ackWaitInMs(500))); err != nil {
+		cb,
+		stan.SetManualAckMode()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	// Send more messages that can be accepted, both member should stall

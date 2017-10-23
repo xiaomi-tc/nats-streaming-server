@@ -2,6 +2,7 @@
 package server
 
 import (
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,17 +10,11 @@ import (
 	"github.com/nats-io/go-nats"
 	"github.com/nats-io/go-nats-streaming"
 	"github.com/nats-io/go-nats-streaming/pb"
-	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
 )
 
-// As of now, it is possible for members of the same group to have different
-// AckWait values. This test checks that if a member with an higher AckWait
-// than the other member leaves, the message with an higher expiration time
-// is set to the remaining member's AckWait value.
-// It also checks that on the opposite case, if a member leaves and the
-// remaining member has a higher AckWait, the original expiration time is
-// maintained.
+// AckWait is for the whole group. The first member that
+// creates the group dictates what the AckWait will be.
 func TestQueueSubsWithDifferentAckWait(t *testing.T) {
 	s := runServer(t, clusterName)
 	defer s.Shutdown()
@@ -50,7 +45,7 @@ func TestQueueSubsWithDifferentAckWait(t *testing.T) {
 	// Create first queue member with high AckWait
 	qsub1, err = sc.QueueSubscribe("foo", "bar", cb,
 		stan.SetManualAckMode(),
-		stan.AckWait(ackWaitInMs(1000)))
+		stan.AckWait(ackWaitInMs(200)))
 	if err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
@@ -72,7 +67,7 @@ func TestQueueSubsWithDifferentAckWait(t *testing.T) {
 	// Check we have the two members
 	checkQueueGroupSize(t, s, "foo", "bar", true, 2)
 	// Close the first, message should be redelivered within
-	// qsub2's AckWait, which is 1 second.
+	// qsub1's AckWait, which is 200ms.
 	qsub1.Close()
 	// Check we have only 1 member
 	checkQueueGroupSize(t, s, "foo", "bar", true, 1)
@@ -80,13 +75,13 @@ func TestQueueSubsWithDifferentAckWait(t *testing.T) {
 	select {
 	case <-rch2:
 	// ok
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(300 * time.Millisecond):
 		t.Fatal("Message should have been redelivered")
 	}
 	// Create 3rd member with higher AckWait than the 2nd
 	qsub3, err = sc.QueueSubscribe("foo", "bar", cb,
 		stan.SetManualAckMode(),
-		stan.AckWait(ackWaitInMs(150)))
+		stan.AckWait(ackWaitInMs(350)))
 	if err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
@@ -95,12 +90,12 @@ func TestQueueSubsWithDifferentAckWait(t *testing.T) {
 	// Check we have only 1 member
 	checkQueueGroupSize(t, s, "foo", "bar", true, 1)
 	// Wait for redelivery. It should happen after the remaining
-	// of the first redelivery to qsub2 and its AckWait, which
-	// should be less than 15 ms.
+	// of the first redelivery to qsub2 and the AckWait, which
+	// should be less than 200 ms.
 	select {
 	case <-rch3:
 	// ok
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(250 * time.Millisecond):
 		t.Fatal("Message should have been redelivered")
 	}
 }
@@ -198,7 +193,7 @@ func TestQueueGroupRemovedOnLastMemberLeaving(t *testing.T) {
 	}
 }
 
-func TestQueueSubscriberTransferPendingMsgsOnClose(t *testing.T) {
+func TestQueueSubscriberMsgsRedeliveredOnClose(t *testing.T) {
 	s := runServer(t, clusterName)
 	defer s.Shutdown()
 
@@ -226,7 +221,8 @@ func TestQueueSubscriberTransferPendingMsgsOnClose(t *testing.T) {
 	sub1, err = sc.QueueSubscribe("foo", "group", cb,
 		stan.DeliverAllAvailable(),
 		stan.MaxInflight(1),
-		stan.SetManualAckMode())
+		stan.SetManualAckMode(),
+		stan.AckWait(ackWaitInMs(250)))
 	if err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
@@ -264,37 +260,39 @@ func TestPersistentStoreQueueSubLeavingUpdateQGroupLastSent(t *testing.T) {
 	if err := sc.Publish("foo", []byte("msg1")); err != nil {
 		t.Fatalf("Unexpected error on publish: %v", err)
 	}
-	ch := make(chan bool)
+	ch := make(chan *stan.Msg)
 	cb := func(m *stan.Msg) {
-		ch <- true
+		ch <- m
 	}
-	// Create a queue subscriber with MaxInflight == 1 and manual ACK
-	// so that it does not ack it and see if it will be redelivered.
-	if _, err := sc.QueueSubscribe("foo", "group", cb,
-		stan.DeliverAllAvailable(),
-		stan.MaxInflight(1),
-		stan.SetManualAckMode()); err != nil {
+	// First queue sub should receive the message that we just sent
+	if _, err := sc.QueueSubscribe("foo", "group", cb, stan.DeliverAllAvailable()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	// Wait to receive the message
-	if err := Wait(ch); err != nil {
-		t.Fatal("Did not get our message")
+	select {
+	case <-ch:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("Should have received first message")
+	}
+	// Start 2nd queue subscriber on same group
+	sub2, err := sc.QueueSubscribe("foo", "group", cb)
+	if err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	// send second message
 	if err := sc.Publish("foo", []byte("msg2")); err != nil {
 		t.Fatalf("Unexpected error on publish: %v", err)
 	}
-	// Start 2nd queue subscriber on same group
-	sub2, err := sc.QueueSubscribe("foo", "group", cb, stan.DeliverAllAvailable())
-	if err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
 	// The second queue subscriber should receive the second message.
-	if err := Wait(ch); err != nil {
-		t.Fatal("Did not get our message")
+	select {
+	case <-ch:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("Should have received second message")
 	}
 	// Unsubscribe the second member
 	sub2.Unsubscribe()
+	// Wait for the unsubscribe to be processed
+	waitForNumSubs(t, s, clientName, 1)
 	// Restart server
 	s.Shutdown()
 	s = runServerWithOpts(t, opts, nil)
@@ -302,30 +300,13 @@ func TestPersistentStoreQueueSubLeavingUpdateQGroupLastSent(t *testing.T) {
 	if err := sc.Publish("foo", []byte("msg3")); err != nil {
 		t.Fatalf("Unexpected error on publish: %v", err)
 	}
-	// Start a third queue subscriber, it should receive message 3
-	msgCh := make(chan *stan.Msg)
-	lastMsgCb := func(m *stan.Msg) {
-		msgCh <- m
-	}
-	if _, err := sc.QueueSubscribe("foo", "group", lastMsgCb, stan.DeliverAllAvailable()); err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-	// Wait for msg3 or an error to occur
-	gotIt := false
 	select {
-	case m := <-msgCh:
-		if m.Sequence != 3 {
-			t.Fatalf("Unexpected message: %v", m)
-		} else {
-			gotIt = true
-			break
+	case m3 := <-ch:
+		if string(m3.Data) != "msg3" {
+			t.Fatalf("Unexpected third message: %v", string(m3.Data))
 		}
 	case <-time.After(250 * time.Millisecond):
-		// Wait for a bit to see if we receive extraneous messages
-		break
-	}
-	if !gotIt {
-		t.Fatal("Did not get message 3")
+		t.Fatalf("Should have received third message")
 	}
 }
 
@@ -335,7 +316,7 @@ func checkQueueGroupSize(t *testing.T, s *StanServer, channelName, groupName str
 	groupSize := 0
 	group, exist := cs.ss.qsubs[groupName]
 	if exist {
-		groupSize = len(group.subs)
+		groupSize = len(group.members)
 	}
 	s.mu.RUnlock()
 	if expectedExist && !exist {
@@ -388,7 +369,7 @@ func TestBasicDurableQueueSub(t *testing.T) {
 		t.Fatal("Did not get our message")
 	}
 	// For this test, make sure we wait for ack to be processed.
-	waitForAcks(t, s, "sc2cid", 1, 0)
+	waitForQGroupAcks(t, s, "foo", "qsub:group", 0)
 	// Close the durable queue sub's connection.
 	// This should not close the queue group
 	sc2.Close()
@@ -509,7 +490,7 @@ func TestPersistentStoreDurableQueueSub(t *testing.T) {
 		t.Fatal("Did not get our message")
 	}
 	// For this test, make sure ack is processed
-	waitForAcks(t, s, "sc2cid", 1, 0)
+	waitForQGroupAcks(t, s, "foo", "qsub:group", 0)
 	// Close the durable queue sub's connection.
 	// This should not close the queue group
 	sc2.Close()
@@ -615,75 +596,12 @@ func TestPersistentStoreQMemberRemovedFromStore(t *testing.T) {
 	ss.RLock()
 	qs := ss.qsubs["dur:group"]
 	ss.RUnlock()
-	if len(qs.subs) != 1 {
-		t.Fatalf("Expected only 1 member, got %v", len(qs.subs))
+	if len(qs.members) != 1 {
+		t.Fatalf("Expected only 1 member, got %v", len(qs.members))
 	}
 }
 
-func TestPersistentStoreMultipleShadowQSubs(t *testing.T) {
-	cleanupDatastore(t)
-	defer cleanupDatastore(t)
-
-	opts := getTestDefaultOptsForPersistentStore()
-	s := runServerWithOpts(t, opts, nil)
-	s.Shutdown()
-
-	var (
-		store stores.Store
-		err   error
-	)
-	limits := stores.DefaultStoreLimits
-	if persistentStoreType == stores.TypeFile {
-		store, err = stores.NewFileStore(testLogger, defaultDataStore, &limits)
-	}
-	if err != nil {
-		t.Fatalf("Error creating store: %v", err)
-	}
-	defer store.Close()
-	cs, err := store.CreateChannel("foo")
-	if err != nil {
-		t.Fatalf("Error creating channel: %v", err)
-	}
-	sub := spb.SubState{
-		ID:            1,
-		AckInbox:      nats.NewInbox(),
-		Inbox:         nats.NewInbox(),
-		AckWaitInSecs: 30,
-		MaxInFlight:   10,
-		LastSent:      1,
-		IsDurable:     true,
-		QGroup:        "dur:queue",
-	}
-	cs.Subs.CreateSub(&sub)
-	sub.ID = 2
-	sub.LastSent = 2
-	cs.Subs.CreateSub(&sub)
-	store.Close()
-
-	// Should not panic
-	s = runServerWithOpts(t, opts, nil)
-	defer s.Shutdown()
-	scs := channelsLookupOrCreate(t, s, "foo")
-	ss := scs.ss
-	ss.RLock()
-	qs := ss.qsubs["dur:queue"]
-	ss.RUnlock()
-	if qs == nil {
-		t.Fatal("Should have recovered queue group")
-	}
-	qs.RLock()
-	shadow := qs.shadow
-	lastSent := qs.lastSent
-	qs.RUnlock()
-	if shadow == nil {
-		t.Fatal("Should have recovered a shadow queue sub")
-	}
-	if shadow.ID != 2 || lastSent != 2 {
-		t.Fatalf("Recovered shadow queue sub should be ID 2, lastSent 2, got %v, %v", shadow.ID, lastSent)
-	}
-}
-
-func TestQueueWithOneStalledMemberDoesNotStallGroup(t *testing.T) {
+func TestQueueMaxInflightAppliesToGroup(t *testing.T) {
 	s := runServer(t, clusterName)
 	defer s.Shutdown()
 
@@ -693,42 +611,52 @@ func TestQueueWithOneStalledMemberDoesNotStallGroup(t *testing.T) {
 	ch := make(chan bool, 1)
 	// Create a member with low MaxInflight and Manual ack mode
 	if _, err := sc.QueueSubscribe("foo", "queue",
-		func(_ *stan.Msg) {
-			ch <- true
+		func(m *stan.Msg) {
+			if m.Sequence == 1 {
+				ch <- true
+			}
 		},
 		stan.MaxInflight(1),
+		stan.AckWait(ackWaitInMs(50)),
 		stan.SetManualAckMode()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
-	if err := sc.Publish("foo", []byte("msg")); err != nil {
-		t.Fatalf("Unexpected error on publish: %v", err)
+	for i := 0; i < 2; i++ {
+		if err := sc.Publish("foo", []byte("msg")); err != nil {
+			t.Fatalf("Unexpected error on publish: %v", err)
+		}
 	}
 	// Check message is received
 	if err := Wait(ch); err != nil {
 		t.Fatal("Did not get our message")
 	}
-	// Create another member with higher MaxInFlight and manual ack mode too.
+	// Create another member with higher MaxInFlight but this should
+	// be ignored and it should not receive the second message,
+	// but it should receive the first as a redelivered.
 	count := 0
-	total := 5
+	errCh := make(chan error, 1)
 	if _, err := sc.QueueSubscribe("foo", "queue",
-		func(_ *stan.Msg) {
+		func(m *stan.Msg) {
 			count++
-			if count == total {
-				ch <- true
+			if count == 1 {
+				if m.Sequence != 1 {
+					errCh <- fmt.Errorf("received %v as the first message", m.Sequence)
+				} else {
+					errCh <- nil
+				}
 			}
 		},
 		stan.MaxInflight(10),
 		stan.SetManualAckMode()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
-	// Send messages and ensure they are received by 2nd member
-	for i := 0; i < total; i++ {
-		if err := sc.Publish("foo", []byte("msg")); err != nil {
-			t.Fatalf("Unexpected error on publish: %v", err)
+	select {
+	case e := <-errCh:
+		if e != nil {
+			t.Fatalf(e.Error())
 		}
-	}
-	if err := Wait(ch); err != nil {
-		t.Fatal("Did not get our messages")
+	case <-time.After(time.Second):
+		t.Fatalf("Message should have been redelivered")
 	}
 }
 
@@ -754,12 +682,12 @@ func TestQueueGroupStalledSemantics(t *testing.T) {
 	defer sc.Close()
 
 	ch := make(chan bool)
-	cb := func(m *stan.Msg) {
+	cb := func(_ *stan.Msg) {
 		ch <- true
 	}
-	// Create a member with manual ack and MaxInFlight of 1
+	// Create a member with manual ack and MaxInFlight of 2
 	if _, err := sc.QueueSubscribe("foo", "queue", cb,
-		stan.SetManualAckMode(), stan.MaxInflight(1)); err != nil {
+		stan.SetManualAckMode(), stan.MaxInflight(2)); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	if err := sc.Publish("foo", []byte("msg")); err != nil {
@@ -768,8 +696,6 @@ func TestQueueGroupStalledSemantics(t *testing.T) {
 	if err := Wait(ch); err != nil {
 		t.Fatal("Did not get our message")
 	}
-	// This member is stalled, and since there is only one member, the
-	// group itself should be stalled.
 	checkStalled := func(expected bool) {
 		var stalled bool
 		timeout := time.Now().Add(time.Second)
@@ -779,7 +705,9 @@ func TestQueueGroupStalledSemantics(t *testing.T) {
 			qs := c.ss.qsubs["queue"]
 			c.ss.RUnlock()
 			qs.RLock()
-			stalled = qs.stalledSubCount == len(qs.subs)
+			qs.sub.RLock()
+			stalled = qs.sub.stalled
+			qs.sub.RUnlock()
 			qs.RUnlock()
 			if stalled != expected {
 				time.Sleep(10 * time.Millisecond)
@@ -791,27 +719,24 @@ func TestQueueGroupStalledSemantics(t *testing.T) {
 			stackFatalf(t, "Expected stalled to be %v, got %v", expected, stalled)
 		}
 	}
-	checkStalled(true)
+	checkStalled(false)
 
-	// Create another member that has a higher MaxInFlight
+	// Create another member
 	if _, err := sc.QueueSubscribe("foo", "queue", cb,
-		stan.SetManualAckMode(), stan.MaxInflight(3)); err != nil {
+		stan.SetManualAckMode()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
-	// That should make the queue sub not stalled
-	checkStalled(false)
-	// Publish 3 messages, check state for each iteration
-	for i := 0; i < 3; i++ {
-		if err := sc.Publish("foo", []byte("msg")); err != nil {
-			t.Fatalf("Unexpected error on publish: %v", err)
-		}
-		if err := Wait(ch); err != nil {
-			t.Fatal("Did not get our message")
-		}
-		stalled := i == 2
-		checkStalled(stalled)
+	// Publish 2nd message
+	if err := sc.Publish("foo", []byte("msg")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+	// Wait for message to received
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our message")
 	}
 	checkStalled(true)
+	waitForQGroupAcks(t, s, "foo", "queue", 2)
+
 	// Replace store with one that will report if Lookup was used
 	s.channels.Lock()
 	c := s.channels.channels["foo"]

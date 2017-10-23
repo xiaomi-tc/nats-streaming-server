@@ -529,6 +529,7 @@ func TestSubStartPositionWithDurableQueueSub(t *testing.T) {
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
 		stan.DeliverAllAvailable(),
 		stan.DurableName("dur"),
+		stan.AckWait(ackWaitInMs(50)),
 		stan.MaxInflight(1)); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
@@ -546,8 +547,7 @@ func TestSubStartPositionWithDurableQueueSub(t *testing.T) {
 	atomic.StoreUint64(&expected, 2)
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
 		stan.StartAtSequence(uint64(total-5)),
-		stan.DurableName("dur"),
-		stan.MaxInflight(1)); err != nil {
+		stan.DurableName("dur")); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	// Wait to receive message and connection to be closed.
@@ -561,8 +561,7 @@ func TestSubStartPositionWithDurableQueueSub(t *testing.T) {
 	atomic.StoreUint64(&expected, 3)
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
 		stan.StartAtSequence(uint64(total+10)),
-		stan.DurableName("dur"),
-		stan.MaxInflight(1)); err != nil {
+		stan.DurableName("dur")); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	// Wait to receive message and connection to be closed.
@@ -577,8 +576,7 @@ func TestSubStartPositionWithDurableQueueSub(t *testing.T) {
 	atomic.StoreUint64(&expected, 4)
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
 		stan.StartAtTime(time.Now().Add(10*time.Second)),
-		stan.DurableName("dur"),
-		stan.MaxInflight(1)); err != nil {
+		stan.DurableName("dur")); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	// Wait to receive message and connection to be closed.
@@ -600,42 +598,58 @@ func TestSubStartPositionWithQueueSub(t *testing.T) {
 		}
 	}
 	ch := make(chan bool)
-	expected := uint64(1)
+	count := 0
+	// Start a queue subsriber at first index that consumes all
+	if _, err := sc.QueueSubscribe("foo", "group", func(_ *stan.Msg) {
+		count++
+		if count == total {
+			ch <- true
+		}
+	},
+		stan.DeliverAllAvailable(),
+		stan.SetManualAckMode()); err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	// Wait for messages to be received
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our message")
+	}
+
+	expected := uint64(0)
 	cb := func(m *stan.Msg) {
 		if m.Sequence == atomic.LoadUint64(&expected) {
 			ch <- true
 		}
 	}
-	// Start a queue subsriber at first index
-	if _, err := sc.QueueSubscribe("foo", "group", cb,
-		stan.DeliverAllAvailable(),
-		stan.MaxInflight(1),
-		stan.SetManualAckMode()); err != nil {
-		t.Fatalf("Unexpected error on subscribe: %v", err)
-	}
-	// Wait for message
-	if err := Wait(ch); err != nil {
-		t.Fatal("Did not get our message")
-	}
-	atomic.StoreUint64(&expected, 2)
-	// Add a member to the group with start sequence
+	// Add a member to the group with start sequence before end of stream
+	atomic.StoreUint64(&expected, uint64(total+2))
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
 		stan.StartAtSequence(uint64(total-5)),
-		stan.MaxInflight(1),
 		stan.SetManualAckMode()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	// Need to publish 2 messages for the second to get to sub2
+	for i := 0; i < 2; i++ {
+		if err := sc.Publish("foo", []byte("msg")); err != nil {
+			t.Fatalf("Unexpected error on publish: %v", err)
+		}
 	}
 	// Wait to receive message
 	if err := Wait(ch); err != nil {
 		t.Fatal("Did not get our message")
 	}
 	// Try with start sequence above total message
-	atomic.StoreUint64(&expected, 3)
+	atomic.StoreUint64(&expected, uint64(total+4))
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
 		stan.StartAtSequence(uint64(total+10)),
-		stan.MaxInflight(1),
 		stan.SetManualAckMode()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	// Need to publish 2 messages for the second to get to sub3
+	for i := 0; i < 2; i++ {
+		if err := sc.Publish("foo", []byte("msg")); err != nil {
+			t.Fatalf("Unexpected error on publish: %v", err)
+		}
 	}
 	// Wait to receive message
 	if err := Wait(ch); err != nil {
@@ -643,12 +657,17 @@ func TestSubStartPositionWithQueueSub(t *testing.T) {
 	}
 	// Try with start time in future, which should not fail if
 	// start position is ignored for queue group
-	atomic.StoreUint64(&expected, 4)
+	atomic.StoreUint64(&expected, uint64(total+6))
 	if _, err := sc.QueueSubscribe("foo", "group", cb,
 		stan.StartAtTime(time.Now().Add(10*time.Second)),
-		stan.MaxInflight(1),
 		stan.SetManualAckMode()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	// Need to publish 2 messages for the second to get to sub4
+	for i := 0; i < 2; i++ {
+		if err := sc.Publish("foo", []byte("msg")); err != nil {
+			t.Fatalf("Unexpected error on publish: %v", err)
+		}
 	}
 	// Wait to receive message
 	if err := Wait(ch); err != nil {

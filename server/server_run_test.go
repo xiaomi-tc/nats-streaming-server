@@ -658,7 +658,7 @@ func TestPersistentStoreRunServer(t *testing.T) {
 			t.Fatal("Expected to get a queue state")
 		}
 		qs.RLock()
-		qsubs := qs.subs
+		qsubs := qs.members
 		qs.RUnlock()
 		if qsubs == nil || len(qsubs) != 2 {
 			t.Fatalf("Unexpected number of queue subscribers of group 'group' for channel bar, got: %v", len(qsubs))

@@ -213,7 +213,11 @@ func TestDroppedMessagesOnSendToQueueSub(t *testing.T) {
 		// Block
 		<-blocked
 		m.Ack()
-	}, stan.MaxInflight(1), stan.DeliverAllAvailable()); err != nil {
+		m.Sub.Close()
+	}, stan.MaxInflight(1),
+		stan.SetManualAckMode(),
+		stan.DeliverAllAvailable(),
+		stan.AckWait(ackWaitInMs(100))); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
 	// Wait for message
@@ -229,11 +233,12 @@ func TestDroppedMessagesOnSendToQueueSub(t *testing.T) {
 	// Start another member, it should receive messages 3, 4 and 5
 	expectedSeq := uint64(3)
 	good := 0
+	ch2 := make(chan bool)
 	cb := func(m *stan.Msg) {
 		if m.Sequence == expectedSeq {
 			good++
 			if good == 3 {
-				ch <- true
+				ch2 <- true
 			}
 		}
 		expectedSeq++
@@ -242,12 +247,12 @@ func TestDroppedMessagesOnSendToQueueSub(t *testing.T) {
 		stan.DeliverAllAvailable()); err != nil {
 		t.Fatalf("Unexpected error on subscribe: %v", err)
 	}
-	// Wait for messages:
-	if err := Wait(ch); err != nil {
-		t.Fatal("Did not get our messages")
-	}
 	// Unlock first member
 	close(blocked)
+	// Wait for messages:
+	if err := Wait(ch2); err != nil {
+		t.Fatal("Did not get our messages")
+	}
 }
 
 func TestPerChannelLimits(t *testing.T) {

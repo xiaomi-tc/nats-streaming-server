@@ -412,11 +412,10 @@ type subStore struct {
 // tracks lastSent for the group.
 type queueState struct {
 	sync.RWMutex
-	lastSent        uint64
-	subs            []*subState
-	shadow          *subState // For durable case, when last member leaves and group is not closed.
-	stalledSubCount int       // number of stalled members
-	newOnHold       bool
+	members           []*subState
+	sub               *subState
+	memberPendingAcks map[uint64]map[uint64]struct{}
+	ackToMember       map[uint64]uint64
 }
 
 // When doing message redelivery due to ack expiration, the function
@@ -485,61 +484,32 @@ func (ss *subStore) Store(sub *subState) error {
 	}
 
 	ss.Lock()
-	ss.updateState(sub)
+	err = ss.updateState(sub)
 	ss.Unlock()
 
-	return nil
+	return err
 }
 
 // Updates the subStore state with this sub.
 // The subStore is locked on entry (or does not need, as during server restart).
 // However, `sub` does not need locking since it has just been created.
-func (ss *subStore) updateState(sub *subState) {
+func (ss *subStore) updateState(sub *subState) error {
 	// Store by type
-	if sub.isQueueSubscriber() {
-		// Queue subscriber.
+	if sub.isQueueMember() {
+		// The group must exist, otherwise it means that it has been deleted
+		// while we were adding a member, so fail the operation.
 		qs := ss.qsubs[sub.QGroup]
 		if qs == nil {
-			qs = &queueState{
-				subs: make([]*subState, 0, 4),
-			}
-			ss.qsubs[sub.QGroup] = qs
+			return fmt.Errorf("group %q does not exist", sub.QGroup)
 		}
 		qs.Lock()
-		// The recovered shadow queue sub will have ClientID=="",
-		// keep a reference to it until a member re-joins the group.
-		if sub.ClientID == "" {
-			// There should be only one shadow queue subscriber, but
-			// we found in https://github.com/nats-io/nats-streaming-server/issues/322
-			// that some datastore had 2 of those (not sure how this happened except
-			// maybe due to upgrades from much older releases that had bugs?).
-			// So don't panic and use as the shadow the one with the highest LastSent
-			// value.
-			if qs.shadow == nil || sub.LastSent > qs.lastSent {
-				qs.shadow = sub
-			}
-		} else {
-			// Store by ackInbox for ack direct lookup
-			ss.acks[sub.AckInbox] = sub
-
-			qs.subs = append(qs.subs, sub)
-		}
-		// Needed in the case of server restart, where
-		// the queue group's last sent needs to be updated
-		// based on the recovered subscriptions.
-		if sub.LastSent > qs.lastSent {
-			qs.lastSent = sub.LastSent
-		}
-		// If the added sub has newOnHold it means that we are doing recovery and
-		// that this member had unacknowledged messages. Mark the queue group
-		// with newOnHold
-		if sub.newOnHold {
-			qs.newOnHold = true
-		}
-		// Update stalled (on recovery)
-		if sub.stalled {
-			qs.stalledSubCount++
-		}
+		// Store by ackInbox for ack direct lookup
+		ss.acks[sub.AckInbox] = sub
+		// Add to the list of members. Do this under qs.sub's lock
+		// so that we are safe when checking isOffline()
+		qs.sub.Lock()
+		qs.members = append(qs.members, sub)
+		qs.sub.Unlock()
 		qs.Unlock()
 		sub.qstate = qs
 	} else {
@@ -554,6 +524,7 @@ func (ss *subStore) updateState(sub *subState) {
 			ss.durables[sub.durableKey()] = sub
 		}
 	}
+	return nil
 }
 
 // Remove a subscriber from the subscription store, leaving durable
@@ -593,9 +564,8 @@ func (ss *subStore) Remove(c *channel, sub *subState, unsubscribe bool) {
 
 	// Delete from storage non durable subscribers on either connection
 	// close or call to Unsubscribe(), and durable subscribers only on
-	// Unsubscribe(). Leave durable queue subs for now, they need to
-	// be treated differently.
-	if !isDurable || (unsubscribe && durableKey != "") {
+	// Unsubscribe(). Always delete a queue member (durable or not)
+	if qgroup != "" || !isDurable || (unsubscribe && durableKey != "") {
 		if err := store.DeleteSub(subid); err != nil {
 			reportError(err)
 		}
@@ -618,128 +588,36 @@ func (ss *subStore) Remove(c *channel, sub *subState, unsubscribe bool) {
 		delete(ss.durables, durableKey)
 	}
 
-	var qsubs map[uint64]*subState
-
 	// Delete ourselves from the list
 	if qs != nil {
-		storageUpdate := false
 		// For queue state, we need to lock specifically,
-		// because qs.subs can be modified by findBestQueueSub,
+		// because qs.members can be modified by findBestQueueSub,
 		// for which we don't have substore lock held.
 		qs.Lock()
-		qs.subs, _ = sub.deleteFromList(qs.subs)
-		if len(qs.subs) == 0 {
+		qs.members, _ = sub.deleteFromList(qs.members)
+		if len(qs.members) == 0 {
 			queueGroupIsEmpty = true
-			// If it was the last being removed, also remove the
-			// queue group from the subStore map, but only if
-			// non durable or explicit unsubscribe.
+			// If not a durable group, or the group is unsubscribed,
+			// remove from list of queue groups and delete record
+			// from storage.
 			if !isDurable || unsubscribe {
 				delete(ss.qsubs, qgroup)
-				// Delete from storage too.
-				if err := store.DeleteSub(subid); err != nil {
+				if err := store.DeleteSub(qs.sub.ID); err != nil {
 					reportError(err)
 				}
-			} else {
-				// Group is durable and last member just left the group,
-				// but didn't call Unsubscribe(). Need to keep a reference
-				// to this sub to maintain the state.
-				qs.shadow = sub
-				// Clear the number of stalled members
-				qs.stalledSubCount = 0
-				// Will need to update the LastSent and clear the ClientID
-				// with a storage update.
-				storageUpdate = true
 			}
-		} else {
-			if sub.stalled && qs.stalledSubCount > 0 {
-				qs.stalledSubCount--
-			}
-			now := time.Now().UnixNano()
-			// If there are pending messages in this sub, they need to be
-			// transferred to remaining queue subscribers.
-			numQSubs := len(qs.subs)
-			idx := 0
-			sub.RLock()
-			// Need to update if this member was the one with the last
-			// message of the group.
-			storageUpdate = sub.LastSent == qs.lastSent
-			sortedPendingMsgs := makeSortedPendingMsgs(sub.acksPending)
-			for _, pm := range sortedPendingMsgs {
-				m, err := c.store.Msgs.Lookup(pm.seq)
-				if err != nil {
-					ss.stan.log.Errorf("Unable to update subscription for %s:%v (%v)", sub.subject, pm.seq, err)
-					continue
-				}
-				// This is possible if message has expired or removed from channel
-				// due to limits. No need to ack it since we are destroying this
-				// subscription.
-				if m == nil {
-					continue
-				}
-				// Get one of the remaning queue subscribers.
-				qsub := qs.subs[idx]
-				qsub.Lock()
-				// Store in storage
-				if err := qsub.store.AddSeqPending(qsub.ID, m.Sequence); err != nil {
-					ss.stan.log.Errorf("[Client:%s] Unable to transfer message to subid=%d, subject=%s, seq=%d, err=%v",
-						clientID, subid, subject, m.Sequence, err)
-					qsub.Unlock()
-					continue
-				}
-				// We don't need to update if the sub's lastSent is transferred
-				// to another queue subscriber.
-				if storageUpdate && m.Sequence == qs.lastSent {
-					storageUpdate = false
-				}
-				// Update LastSent if applicable
-				if m.Sequence > qsub.LastSent {
-					qsub.LastSent = m.Sequence
-				}
-				// As of now, members can have different AckWait values.
-				expirationTime := pm.expire
-				// If the member the message is transferred to has a higher AckWait,
-				// keep original expiration time, otherwise check that it is smaller
-				// than the new AckWait.
-				if sub.ackWait > qsub.ackWait && expirationTime-now > 0 {
-					expirationTime = now + int64(qsub.ackWait)
-				}
-				// Store in ackPending.
-				qsub.acksPending[m.Sequence] = expirationTime
-				// Keep track of this qsub
-				if qsubs == nil {
-					qsubs = make(map[uint64]*subState)
-				}
-				if _, tracked := qsubs[qsub.ID]; !tracked {
-					qsubs[qsub.ID] = qsub
-				}
-				qsub.Unlock()
-				// Move to the next queue subscriber, going back to first if needed.
-				idx++
-				if idx == numQSubs {
-					idx = 0
-				}
-			}
-			sub.RUnlock()
-			// Even for durable queue subscribers, if this is not the last
-			// member, we need to delete from storage (we did that higher in
-			// that function for non durable case). Issue #215.
+			qs.sub.Lock()
+			qs.sub.clearAckTimer()
+			// Since the group is empty, if it is durable, reset initialized
+			// to false so that when a new member joins, we are in the proper
+			// state.
 			if isDurable {
-				if err := store.DeleteSub(subid); err != nil {
-					reportError(err)
-				}
+				qs.sub.initialized = false
 			}
-		}
-		if storageUpdate {
-			// If we have a shadow sub, use that one, othewise any queue subscriber
-			// will do, so use the first.
-			qsub := qs.shadow
-			if qsub == nil {
-				qsub = qs.subs[0]
-			}
-			qsub.Lock()
-			qsub.LastSent = qs.lastSent
-			qsub.store.UpdateSub(&qsub.SubState)
-			qsub.Unlock()
+			qs.sub.Unlock()
+			// For durable groups that go offline, we don't need to
+			// update to storage. A group is considered offline if
+			// it has no member.
 		}
 		qs.Unlock()
 	} else {
@@ -763,13 +641,6 @@ func (ss *subStore) Remove(c *channel, sub *subState, unsubscribe bool) {
 		}
 	}
 	ss.Unlock()
-
-	// Calling this will sort current pending messages and ensure
-	// that the ackTimer is properly set. It does not necessarily
-	// mean that messages are going to be redelivered on the spot.
-	for _, qsub := range qsubs {
-		ss.stan.performAckExpirationRedelivery(qsub, false)
-	}
 
 	if log != nil {
 		traceCtx := subStateTraceCtx{clientID: clientID, isRemove: true, isUnsubscribe: unsubscribe, isGroupEmpty: queueGroupIsEmpty}
@@ -1511,6 +1382,12 @@ func (s *StanServer) processRecoveredClients(clients []*stores.Client) {
 	s.clients.recoverClients(clients)
 }
 
+type byRecoveredSubID []*stores.RecoveredSubscription
+
+func (rs byRecoveredSubID) Len() int           { return len(rs) }
+func (rs byRecoveredSubID) Less(i, j int) bool { return rs[i].Sub.ID < rs[j].Sub.ID }
+func (rs byRecoveredSubID) Swap(i, j int)      { rs[i], rs[j] = rs[j], rs[i] }
+
 // Reconstruct the subscription state on restart.
 // We don't use locking in there because there is no communication
 // with the NATS server and/or clients, so no chance that the state
@@ -1530,6 +1407,9 @@ func (s *StanServer) processRecoveredChannels(channels map[string]*stores.Recove
 
 	for channelName, recoveredChannel := range channels {
 		channel := s.channels.create(s, channelName, recoveredChannel.Channel)
+		// Order subscriptions by ID to make sure that queue group meta sub
+		// comes before its members.
+		sort.Sort(byRecoveredSubID(recoveredChannel.Subscriptions))
 		// Get the recovered subscriptions for this channel.
 		for _, recSub := range recoveredChannel.Subscriptions {
 			// Create a subState
@@ -1538,21 +1418,24 @@ func (s *StanServer) processRecoveredChannels(channels map[string]*stores.Recove
 				ackWait: computeAckWait(recSub.Sub.AckWaitInSecs),
 				store:   channel.store.Subs,
 			}
-			sub.acksPending = make(map[uint64]int64, len(recSub.Pending))
-			for seq := range recSub.Pending {
-				sub.acksPending[seq] = 0
-			}
-			if len(sub.acksPending) > 0 {
-				// Prevent delivery of new messages until resent of old ones
-				sub.newOnHold = true
-				// We may not need to set this because this would be set
-				// during the initial redelivery attempt, but does not hurt.
-				if int32(len(sub.acksPending)) >= sub.MaxInFlight {
-					sub.stalled = true
-				}
-			}
 			// Copy over fields from SubState protobuf
 			sub.SubState = *recSub.Sub
+			// Do this for non queue subscriptions, or only for the meta sub of the queue group
+			if !sub.isQueueMember() {
+				sub.acksPending = make(map[uint64]int64, len(recSub.Pending))
+				for seq := range recSub.Pending {
+					sub.acksPending[seq] = 0
+				}
+				if len(sub.acksPending) > 0 {
+					// Prevent delivery of new messages until resent of old ones
+					sub.newOnHold = true
+					// We may not need to set this because this would be set
+					// during the initial redelivery attempt, but does not hurt.
+					if int32(len(sub.acksPending)) >= sub.MaxInFlight {
+						sub.stalled = true
+					}
+				}
+			}
 			// When recovering older stores, IsDurable may not exist for
 			// durable subscribers. Set it now.
 			durableSub := sub.isDurableSubscriber() // not a durable queue sub!
@@ -1570,26 +1453,20 @@ func (s *StanServer) processRecoveredChannels(channels map[string]*stores.Recove
 					continue
 				}
 			}
-			// Add the subscription to the corresponding client
-			added := s.clients.addSub(sub.ClientID, sub)
-			if added || sub.IsDurable {
-				// Repair for issue https://github.com/nats-io/nats-streaming-server/issues/215
-				// Do not recover a queue durable subscriber that still
-				// has ClientID but for which connection was closed (=>!added)
-				if !added && sub.isQueueDurableSubscriber() && !sub.isShadowQueueDurable() {
-					s.log.Noticef("WARN: Not recovering ghost durable queue subscriber: [%s]:[%s] subject=%s inbox=%s", sub.ClientID, sub.QGroup, sub.subject, sub.Inbox)
-					continue
-				}
-				// Fix for older offline durable subscribers. Newer offline durable
-				// subscribers have IsClosed set to true and therefore are handled aboved.
-				if durableSub && !added {
-					processOfflineSub(channel, sub)
-				} else {
-					// Add this subscription to subStore.
-					channel.ss.updateState(sub)
-					// Add to the array, unless this is the shadow durable queue sub that
-					// was left in the store in order to maintain the group's state.
-					if !sub.isShadowQueueDurable() {
+			if sub.isQueueGroupInternalSub() {
+				channel.ss.qsubs[sub.QGroup] = createQueueState(sub)
+				allSubs = append(allSubs, sub)
+			} else {
+				// Add the subscription to the corresponding client
+				added := s.clients.addSub(sub.ClientID, sub)
+				if added || sub.IsDurable {
+					// Fix for older offline durable subscribers. Newer offline durable
+					// subscribers have IsClosed set to true and therefore are handled aboved.
+					if durableSub && !added {
+						processOfflineSub(channel, sub)
+					} else {
+						// Add this subscription to subStore.
+						channel.ss.updateState(sub)
 						allSubs = append(allSubs, sub)
 						s.monMu.Lock()
 						s.numSubs++
@@ -1602,6 +1479,19 @@ func (s *StanServer) processRecoveredChannels(channels map[string]*stores.Recove
 	return allSubs
 }
 
+// Helper function that creates a queueState object
+func createQueueState(sub *subState) *queueState {
+	qs := &queueState{
+		members:           make([]*subState, 0, 4),
+		sub:               sub,
+		memberPendingAcks: make(map[uint64]map[uint64]struct{}),
+		ackToMember:       make(map[uint64]uint64),
+	}
+	// For consistency, have qs.sub.qstate point to qs
+	qs.sub.qstate = qs
+	return qs
+}
+
 // Do some final setup. Be minded of locking here since the server
 // has started communication with NATS server/clients.
 func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, recoveredSubs []*subState) error {
@@ -1610,7 +1500,8 @@ func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, r
 		sub.Lock()
 		// To be on the safe side, just check that the ackSub has not
 		// been created (may happen with durables that may reconnect maybe?)
-		if sub.ackSub == nil {
+		// Exclude queue group meta sub
+		if sub.ackSub == nil && !sub.isQueueGroupInternalSub() {
 			if len(sub.AckInbox) <= natsInboxPrefixLen {
 				err = fmt.Errorf("invalid ack inbox: %s", sub.AckInbox)
 			} else {
@@ -1683,17 +1574,17 @@ func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, r
 func (s *StanServer) performRedeliveryOnStartup(recoveredSubs []*subState) {
 	defer s.wg.Done()
 
-	queues := make(map[*queueState]*channel)
-
 	for _, sub := range recoveredSubs {
 		// Ignore subs that did not have any ack pendings on startup.
+		// Also ignore queue members, since only the queue group's sub
+		// is having pending messages.
 		sub.Lock()
-		if !sub.newOnHold {
+		if !sub.newOnHold || sub.isQueueMember() {
 			sub.Unlock()
 			continue
 		}
 		// If this is a durable and it is offline, then skip the rest.
-		if sub.isOfflineDurableSubscriber() {
+		if sub.isOffline() {
 			sub.newOnHold = false
 			sub.Unlock()
 			continue
@@ -1701,7 +1592,7 @@ func (s *StanServer) performRedeliveryOnStartup(recoveredSubs []*subState) {
 		// Unlock in order to call function below
 		sub.Unlock()
 		// Send old messages (lock is acquired in that function)
-		s.performAckExpirationRedelivery(sub, true)
+		s.performAckExpirationRedelivery(sub, false)
 		// Regrab lock
 		sub.Lock()
 		// Allow new messages to be delivered
@@ -1715,17 +1606,10 @@ func (s *StanServer) performRedeliveryOnStartup(recoveredSubs []*subState) {
 		}
 		// Kick delivery of (possible) new messages
 		if qs != nil {
-			queues[qs] = c
+			s.sendAvailableMessagesToQueue(c, qs)
 		} else {
 			s.sendAvailableMessages(c, sub)
 		}
-	}
-	// Kick delivery for queues that had members with newOnHold
-	for qs, c := range queues {
-		qs.Lock()
-		qs.newOnHold = false
-		qs.Unlock()
-		s.sendAvailableMessagesToQueue(c, qs)
 	}
 }
 
@@ -2226,20 +2110,23 @@ func (s *StanServer) sendPublishErr(subj, guid string, err error) {
 	}
 }
 
-// FIXME(dlc) - place holder to pick sub that has least outstanding, should just sort,
-// or use insertion sort, etc.
-func findBestQueueSub(sl []*subState) *subState {
+// Returns the member best suited to receive a message.
+// Assumes qs lock held for write
+func (qs *queueState) findBestQueueSub() *subState {
 	var (
 		leastOutstanding = int(^uint(0) >> 1)
 		rsub             *subState
+		sl               = qs.members
 	)
 	for _, sub := range sl {
-
 		sub.RLock()
-		sOut := len(sub.acksPending)
+		sID := sub.ID
 		sStalled := sub.stalled
 		sHasFailedHB := sub.hasFailedHB
 		sub.RUnlock()
+
+		// Number of messages sent to this member
+		sOut := len(qs.memberPendingAcks[sID])
 
 		// Favor non stalled subscribers and clients that do not have failed heartbeats
 		if !sStalled && !sHasFailedHB {
@@ -2258,30 +2145,44 @@ func findBestQueueSub(sl []*subState) *subState {
 		copy(sl, sl[1:len])
 		sl[len-1] = rsub
 	}
-
 	return rsub
 }
 
 // Send a message to the queue group
 // Assumes qs lock held for write
-func (s *StanServer) sendMsgToQueueGroup(qs *queueState, m *pb.MsgProto, force bool) (*subState, bool, bool) {
-	sub := findBestQueueSub(qs.subs)
-	if sub == nil {
-		return nil, false, false
+func (s *StanServer) sendMsgToQueueGroup(qs *queueState, m *pb.MsgProto, force bool) (bool, bool) {
+	member := qs.findBestQueueSub()
+	if member == nil {
+		return false, false
 	}
-	sub.Lock()
-	wasStalled := sub.stalled
-	didSend, sendMore := s.sendMsgToSub(sub, m, force)
-	// If this is not a redelivery and the sub was not stalled, but now is,
-	// bump the number of stalled members.
-	if !force && !wasStalled && sub.stalled {
-		qs.stalledSubCount++
+	member.RLock()
+	cid := member.ClientID
+	mid := member.ID
+	minbox := member.Inbox
+	member.RUnlock()
+	// Look if the message was already pending on another sub
+	if m.Redelivered {
+		prevMemberID := qs.ackToMember[m.Sequence]
+		if prevMemberID > 0 {
+			mpa := qs.memberPendingAcks[prevMemberID]
+			if mpa != nil {
+				delete(mpa, m.Sequence)
+			}
+		}
 	}
-	if didSend && sub.LastSent > qs.lastSent {
-		qs.lastSent = sub.LastSent
+	qs.sub.Lock()
+	didSend, sendMore := s.sendMsgToSub(qs.sub, mid, cid, minbox, m, force)
+	qs.sub.Unlock()
+	if didSend {
+		mpa := qs.memberPendingAcks[mid]
+		if mpa == nil {
+			mpa = make(map[uint64]struct{})
+			qs.memberPendingAcks[mid] = mpa
+		}
+		mpa[m.Sequence] = struct{}{}
+		qs.ackToMember[m.Sequence] = mid
 	}
-	sub.Unlock()
-	return sub, didSend, sendMore
+	return didSend, sendMore
 }
 
 // processMsg will process a message, and possibly send to clients, etc.
@@ -2355,14 +2256,12 @@ func (s *StanServer) performDurableRedelivery(c *channel, sub *subState) {
 	clientID := sub.ClientID
 	newOnHold := sub.newOnHold
 	subID := sub.ID
+	inbox := sub.Inbox
 	sub.RUnlock()
 
 	if s.debug && len(sortedSeqs) > 0 {
 		sub.RLock()
 		durName := sub.DurableName
-		if durName == "" {
-			durName = sub.QGroup
-		}
 		sub.RUnlock()
 		s.log.Debugf("[Client:%s] Redelivering to subid=%d, durable=%s", clientID, subID, durName)
 	}
@@ -2379,16 +2278,12 @@ func (s *StanServer) performDurableRedelivery(c *channel, sub *subState) {
 			continue
 		}
 
-		if s.trace {
-			s.log.Tracef("[Client:%s] Redelivering to subid=%d, seq=%d", clientID, subID, m.Sequence)
-		}
-
 		// Flag as redelivered.
 		m.Redelivered = true
 
 		sub.Lock()
 		// Force delivery
-		s.sendMsgToSub(sub, m, forceDelivery)
+		s.sendMsgToSub(sub, subID, clientID, inbox, m, forceDelivery)
 		sub.Unlock()
 	}
 	// Release newOnHold if needed.
@@ -2400,7 +2295,7 @@ func (s *StanServer) performDurableRedelivery(c *channel, sub *subState) {
 }
 
 // Redeliver all outstanding messages that have expired.
-func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup bool) {
+func (s *StanServer) performAckExpirationRedelivery(sub *subState, sendEvenIfNotExpired bool) {
 	// Sort our messages outstanding from acksPending, grab some state and unlock.
 	sub.Lock()
 	sortedPendingMsgs := makeSortedPendingMsgs(sub.acksPending)
@@ -2414,6 +2309,7 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 	qs := sub.qstate
 	clientID := sub.ClientID
 	subID := sub.ID
+	inbox := sub.Inbox
 	if sub.ackTimer == nil {
 		s.setupAckTimer(sub, sub.ackWait)
 	}
@@ -2429,6 +2325,7 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 			return
 		}
 	}
+	qgroup := sub.QGroup
 	sub.Unlock()
 
 	c := s.channels.get(subject)
@@ -2446,10 +2343,8 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 	// limit is now plus a buffer of 15ms to avoid repeated timer callbacks.
 	limit := now + int64(15*time.Millisecond)
 
-	var pick *subState
 	sent := false
 	needToSetExpireTime := false
-	tracePrinted := false
 	nextExpirationTIme := int64(0)
 
 	// We will move through acksPending(sorted) and see what needs redelivery.
@@ -2458,33 +2353,43 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 		if m == nil {
 			continue
 		}
-		expireTime := pm.expire
-		if expireTime == 0 {
-			needToSetExpireTime = true
-			expireTime = m.Timestamp + expTime
-		}
-
-		// If this message has not yet expired, reset timer for next callback
-		if expireTime > limit {
-			if nextExpirationTIme == 0 {
-				nextExpirationTIme = expireTime
+		if sendEvenIfNotExpired {
+			sub.Lock()
+			// If message is still pending then reset its expiration time to 0.
+			// The send function will set it to proper valie.
+			_, present := sub.acksPending[pm.seq]
+			if present {
+				sub.acksPending[pm.seq] = 0
 			}
-			if !tracePrinted && s.trace {
-				tracePrinted = true
-				s.log.Tracef("[Client:%s] Redelivery for subid=%d, skipping seq=%d", clientID, subID, m.Sequence)
-			}
-			if needToSetExpireTime {
-				sub.Lock()
-				// Is message still pending?
-				if _, present := sub.acksPending[pm.seq]; present {
-					// Update expireTime
-					expireTime = time.Now().UnixNano() + expTime
-					sub.acksPending[pm.seq] = expireTime
-				}
-				sub.Unlock()
+			sub.Unlock()
+			if !present {
 				continue
 			}
-			break
+		} else {
+			expireTime := pm.expire
+			if expireTime == 0 {
+				needToSetExpireTime = true
+				expireTime = m.Timestamp + expTime
+			}
+
+			// If this message has not yet expired, reset timer for next callback
+			if expireTime > limit {
+				if nextExpirationTIme == 0 {
+					nextExpirationTIme = expireTime
+				}
+				if needToSetExpireTime {
+					sub.Lock()
+					// Is message still pending?
+					if _, present := sub.acksPending[pm.seq]; present {
+						// Update expireTime
+						expireTime = time.Now().UnixNano() + expTime
+						sub.acksPending[pm.seq] = expireTime
+					}
+					sub.Unlock()
+					continue
+				}
+				break
+			}
 		}
 
 		// Flag as redelivered.
@@ -2492,26 +2397,17 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 
 		// Handle QueueSubscribers differently, since we will choose best subscriber
 		// to redeliver to, not necessarily the same one.
-		// However, on startup, resends only to member that had previously this message
-		// otherwise this could cause a message to be redelivered to multiple members.
-		if qs != nil && !isStartup {
+		if qs != nil {
 			qs.Lock()
-			pick, sent, _ = s.sendMsgToQueueGroup(qs, m, forceDelivery)
+			sent, _ = s.sendMsgToQueueGroup(qs, m, forceDelivery)
 			qs.Unlock()
-			if pick == nil {
-				s.log.Errorf("[Client:%s] Unable to find queue subscriber for subid=%d", clientID, subID)
+			if !sent {
+				s.log.Errorf("[Queue:%s] Unable to find queue member", qgroup)
 				break
-			}
-			// If the message is redelivered to a different queue subscriber,
-			// we need to process an implicit ack for the original subscriber.
-			// We do this only after confirmation that it was successfully added
-			// as pending on the other queue subscriber.
-			if pick != sub && sent {
-				s.processAck(c, sub, m.Sequence)
 			}
 		} else {
 			sub.Lock()
-			s.sendMsgToSub(sub, m, forceDelivery)
+			s.sendMsgToSub(sub, subID, clientID, inbox, m, forceDelivery)
 			sub.Unlock()
 		}
 	}
@@ -2545,7 +2441,7 @@ func (s *StanServer) getMsgForRedelivery(c *channel, sub *subState, seq uint64) 
 // of acksPending is greater or equal to the sub's MaxInFlight limit, messages
 // are not sent and subscriber is marked as stalled.
 // Sub lock should be held before calling.
-func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) (bool, bool) {
+func (s *StanServer) sendMsgToSub(sub *subState, id uint64, cid, inbox string, m *pb.MsgProto, force bool) (bool, bool) {
 	if sub == nil || m == nil || !sub.initialized || (sub.newOnHold && !m.Redelivered) {
 		return false, false
 	}
@@ -2565,7 +2461,7 @@ func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) (bo
 			action = "Delivering"
 		}
 		s.log.Tracef("[Client:%s] %s msg to subid=%d, subject=%s, seq=%d",
-			sub.ClientID, action, sub.ID, m.Subject, m.Sequence)
+			cid, action, id, m.Subject, m.Sequence)
 	}
 
 	// Marshal of a pb.MsgProto cannot fail
@@ -2575,9 +2471,9 @@ func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) (bo
 	if len(b) == 0 {
 		panic("store implementation returned an empty message")
 	}
-	if err := s.ncs.Publish(sub.Inbox, b); err != nil {
+	if err := s.ncs.Publish(inbox, b); err != nil {
 		s.log.Errorf("[Client:%s] Failed sending to subid=%d, subject=%s, seq=%d, err=%v",
-			sub.ClientID, sub.ID, m.Subject, m.Sequence, err)
+			cid, id, m.Subject, m.Sequence, err)
 		return false, false
 	}
 
@@ -2604,7 +2500,7 @@ func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) (bo
 	// Store in storage
 	if err := sub.store.AddSeqPending(sub.ID, m.Sequence); err != nil {
 		s.log.Errorf("[Client:%s] Unable to add pending message to subid=%d, subject=%s, seq=%d, err=%v",
-			sub.ClientID, sub.ID, m.Subject, m.Sequence, err)
+			cid, id, m.Subject, m.Sequence, err)
 		return false, false
 	}
 
@@ -3002,19 +2898,15 @@ func (sub *subState) durableKey() string {
 	return fmt.Sprintf("%s-%s-%s", sub.ClientID, sub.subject, sub.DurableName)
 }
 
-// Returns true if this sub is a queue subscriber (durable or not)
-func (sub *subState) isQueueSubscriber() bool {
-	return sub.QGroup != ""
+// Returns true if this sub is a queue member (durable or not).
+// This returns false for the QueueGroup internal sub.
+func (sub *subState) isQueueMember() bool {
+	return sub.QGroup != "" && sub.Inbox != ""
 }
 
-// Returns true if this sub is a durable queue subscriber
-func (sub *subState) isQueueDurableSubscriber() bool {
-	return sub.QGroup != "" && sub.IsDurable
-}
-
-// Returns true if this is a "shadow" durable queue subscriber
-func (sub *subState) isShadowQueueDurable() bool {
-	return sub.IsDurable && sub.QGroup != "" && sub.ClientID == ""
+// Returns true if this is the internal sub for the queue group
+func (sub *subState) isQueueGroupInternalSub() bool {
+	return sub.QGroup != "" && sub.Inbox == ""
 }
 
 // Returns true if this sub is a durable subscriber (not a durable queue sub)
@@ -3022,9 +2914,12 @@ func (sub *subState) isDurableSubscriber() bool {
 	return sub.DurableName != ""
 }
 
-// Returns true if this is an offline durable subscriber.
-func (sub *subState) isOfflineDurableSubscriber() bool {
-	return sub.DurableName != "" && sub.ClientID == ""
+// Returns true if this is an offline subscriber.
+func (sub *subState) isOffline() bool {
+	if sub.qstate == nil {
+		return sub.DurableName != "" && sub.ClientID == ""
+	}
+	return len(sub.qstate.members) == 0
 }
 
 // Used to generate durable key. This should not be called on non-durables.
@@ -3142,47 +3037,29 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 	// Get the subStore
 	ss := c.ss
 
-	var sub *subState
+	var (
+		sub             *subState
+		isDurable       bool // true for durable queue subscribers and durable subscribers alike.
+		isResumed       bool // true if this is the restart of a durable or first member to rejoin durable queue group.
+		isQGInitialized bool // true if the queue group's internal sub is initialized.
+		subStartTrace   string
+	)
 
 	ackInbox, ackSubject := s.createAckInboxAndSubject()
 
-	// Will be true for durable queue subscribers and durable subscribers alike.
-	isDurable := false
 	// Will be set to false for en existing durable subscriber or existing
 	// queue group (durable or not).
 	setStartPos := true
-	// Check for durable queue subscribers
+	// Check for queue subscribers
 	if sr.QGroup != "" {
-		if sr.DurableName != "" {
-			// For queue subscribers, we prevent DurableName to contain
-			// the ':' character, since we use it for the compound name.
-			if strings.Contains(sr.DurableName, ":") {
-				s.log.Errorf("[Client:%s] Invalid DurableName (%q) for queue subscriber from %s",
-					sr.ClientID, sr.DurableName, sr.Subject)
-				s.sendSubscriptionResponseErr(m.Reply, ErrInvalidDurName)
-				return
-			}
-			isDurable = true
-			// Make the queue group a compound name between durable name and q group.
-			sr.QGroup = fmt.Sprintf("%s:%s", sr.DurableName, sr.QGroup)
-			// Clear DurableName from this subscriber.
-			sr.DurableName = ""
+		isDurable, isQGInitialized, isResumed, subStartTrace, err = s.processQSubRequest(c, sr)
+		if err != nil {
+			s.sendSubscriptionResponseErr(m.Reply, err)
+			return
 		}
-		// Lookup for an existing group. Only interested in situation where
-		// the group exist, but is empty and had a shadow subscriber.
-		ss.RLock()
-		qs := ss.qsubs[sr.QGroup]
-		if qs != nil {
-			qs.Lock()
-			if qs.shadow != nil {
-				sub = qs.shadow
-				qs.shadow = nil
-				qs.subs = append(qs.subs, sub)
-			}
-			qs.Unlock()
-			setStartPos = false
-		}
-		ss.RUnlock()
+		// The member that is going to be created must not set
+		// its own start sequence.
+		setStartPos = false
 	} else if sr.DurableName != "" {
 		// Check for DurableSubscriber status
 		if sub = ss.LookupByDurable(durableKey(sr)); sub != nil {
@@ -3199,12 +3076,9 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 		}
 		isDurable = true
 	}
-	var (
-		subStartTrace string
-		subIsNew      bool
-	)
 	if sub != nil {
 		// ok we have a remembered subscription
+		isResumed = true
 		sub.Lock()
 		// Set ClientID and new AckInbox but leave LastSent to the
 		// remembered value.
@@ -3232,7 +3106,6 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 		// subscriber re-joining a group that was left with pending messages.
 		err = s.updateDurable(ss, sub)
 	} else {
-		subIsNew = true
 		// Create sub here (can be plain, durable or queue subscriber)
 		sub = &subState{
 			SubState: spb.SubState{
@@ -3245,10 +3118,13 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 				DurableName:   sr.DurableName,
 				IsDurable:     isDurable,
 			},
-			subject:     sr.Subject,
-			ackWait:     computeAckWait(sr.AckWaitInSecs),
-			acksPending: make(map[uint64]int64),
-			store:       c.store.Subs,
+			subject: sr.Subject,
+			ackWait: computeAckWait(sr.AckWaitInSecs),
+			store:   c.store.Subs,
+		}
+		// We don't need that for queue members
+		if sr.QGroup == "" {
+			sub.acksPending = make(map[uint64]int64)
 		}
 
 		if setStartPos {
@@ -3271,7 +3147,7 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 		return
 	}
 	if s.debug {
-		traceCtx := subStateTraceCtx{clientID: sr.ClientID, isNew: subIsNew, startTrace: subStartTrace}
+		traceCtx := subStateTraceCtx{clientID: sr.ClientID, isResume: isResumed, startTrace: subStartTrace}
 		traceSubState(s.log, sub, &traceCtx)
 	}
 
@@ -3311,13 +3187,125 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 	sub.initialized = true
 	sub.Unlock()
 
+	if qs != nil {
+		qs.Lock()
+		// If the queue group is new or resumed, make sure that we don't allow
+		// sending messages to the new member until after we have sent the response.
+		// So if needed, set the group's flag to initialized now.
+		if !isQGInitialized {
+			qs.sub.Lock()
+			qs.sub.initialized = true
+			qs.sub.Unlock()
+		}
+		// For queue member, pass the queue group's sub to the start routine.
+		sub = qs.sub
+		qs.Unlock()
+	}
+
 	s.subStartCh <- &subStartInfo{c: c, sub: sub, qs: qs, isDurable: isDurable}
+}
+
+// Process a subscription request that is known to be for a Queue.
+// Note that some of the incoming pb.SubscriptionRequest fields will be changed.
+//
+// Returns:
+// isDurable: 	  the queue is durable.
+// isInitialized: value of the group's internal sub's initialized flag.
+// isResumed: 	  if the group is durable and had no member before processing this new request.
+// subStartTrace: string used for logging when the queue subscription is created/resumed.
+// error: 		  if an error occurred.
+func (s *StanServer) processQSubRequest(c *channel, sr *pb.SubscriptionRequest) (bool, bool, bool, string, error) {
+	var (
+		ss            = c.ss
+		isDurable     bool
+		isInitialized bool
+		isResumed     bool
+		subStartTrace string
+	)
+	if sr.DurableName != "" {
+		// For queue subscribers, we prevent DurableName to contain
+		// the ':' character, since we use it for the compound name.
+		if strings.Contains(sr.DurableName, ":") {
+			s.log.Errorf("[Client:%s] Invalid DurableName (%q) for queue subscriber from %s",
+				sr.ClientID, sr.DurableName, sr.Subject)
+			return false, false, false, "", ErrInvalidDurName
+		}
+		isDurable = true
+		// Make the queue group a compound name between durable name and q group.
+		sr.QGroup = fmt.Sprintf("%s:%s", sr.DurableName, sr.QGroup)
+		// Clear DurableName from this subscriber.
+		sr.DurableName = ""
+	}
+	// Lookup for an existing group, create one if needed.
+	ss.Lock()
+	qs := ss.qsubs[sr.QGroup]
+	if qs == nil {
+		qs = createQueueState(&subState{
+			SubState: spb.SubState{
+				QGroup:        sr.QGroup,
+				MaxInFlight:   sr.MaxInFlight,
+				AckWaitInSecs: sr.AckWaitInSecs,
+				IsDurable:     isDurable,
+			},
+			subject:     sr.Subject,
+			ackWait:     computeAckWait(sr.AckWaitInSecs),
+			acksPending: make(map[uint64]int64),
+			store:       c.store.Subs,
+		})
+		// Adds to storage.
+		if err := qs.sub.store.CreateSub(&qs.sub.SubState); err != nil {
+			ss.Unlock()
+			s.log.Errorf("Unable to store subscription [%v:%v] on [%s]: %v", sr.ClientID, sr.Inbox, sr.Subject, err)
+			return false, false, false, "", err
+		}
+		trace, err := s.setSubStartSequence(c, qs.sub, sr)
+		if err != nil {
+			ss.Unlock()
+			s.log.Errorf("Error setting start sequence for subscription [%v:%v] on [%s]: %v", sr.ClientID, sr.Inbox, sr.Subject, err)
+			return false, false, false, "", err
+		}
+		subStartTrace = trace
+		// On success, add to the map of queue groups.
+		ss.qsubs[sr.QGroup] = qs
+		// New member, new group. We need to wait for the user's subscription
+		// response to be sent before switching the group's sub initialized
+		// flag.
+		isInitialized = false
+	} else {
+		qs.Lock()
+		qs.sub.Lock()
+		// Durable queue group that had no member...
+		if len(qs.members) == 0 {
+			if len(qs.sub.acksPending) > 0 {
+				// We have a durable with pending messages, set newOnHold
+				// until we have performed the initial redelivery.
+				qs.sub.newOnHold = true
+				s.setupAckTimer(qs.sub, qs.sub.ackWait)
+			}
+			isResumed = true
+		}
+		// qs.sub.initialized flag would be set to false when the last
+		// member of a durable queue group had left. But let's check
+		// the flag value here since there could have been an error after
+		// the queue group was first created and the member fully initialized.
+		isInitialized = qs.sub.initialized
+
+		// For good measure, override request's AckWaitInSecs and MaxInflight with
+		// what the group has.
+		sr.AckWaitInSecs = qs.sub.AckWaitInSecs
+		sr.MaxInFlight = qs.sub.MaxInFlight
+		qs.sub.Unlock()
+		qs.Unlock()
+	}
+	ss.Unlock()
+
+	return isDurable, isInitialized, isResumed, subStartTrace, nil
 }
 
 type subStateTraceCtx struct {
 	clientID      string
 	isRemove      bool
-	isNew         bool
+	isResume      bool
 	isUnsubscribe bool
 	isGroupEmpty  bool
 	startTrace    string
@@ -3351,9 +3339,10 @@ func traceSubState(log logger.Logger, sub *subState, ctx *subStateTraceCtx) {
 	} else {
 		if ctx.startTrace != "" {
 			prefix = "Started new"
-		} else if sub.QGroup != "" && ctx.isNew {
+		} else if sub.QGroup != "" && !ctx.isResume {
 			prefix = "Added member to"
-		} else if sub.IsDurable {
+		} else {
+			// durable sub or first queue member to rejoin the group
 			prefix = "Resumed"
 		}
 	}
@@ -3413,12 +3402,26 @@ func (s *StanServer) processSubscriptionsStart() {
 		select {
 		case subStart := <-s.subStartCh:
 			c := subStart.c
-			sub := subStart.sub
+			sub := subStart.sub // this is qs.sub if qs is not nil
 			qs := subStart.qs
 			isDurable := subStart.isDurable
 			if isDurable {
 				// Redeliver any outstanding.
-				s.performDurableRedelivery(c, sub)
+				if qs != nil {
+					sub.RLock()
+					newOnHold := sub.newOnHold
+					sub.RUnlock()
+					// If a durable queue group, force redelivery
+					// when member resumes the group.
+					s.performAckExpirationRedelivery(sub, newOnHold)
+					if newOnHold {
+						sub.Lock()
+						sub.newOnHold = false
+						sub.Unlock()
+					}
+				} else {
+					s.performDurableRedelivery(c, sub)
+				}
 			}
 			// publish messages to this subscriber
 			if qs != nil {
@@ -3449,31 +3452,48 @@ func (s *StanServer) processAckMsg(m *nats.Msg) {
 }
 
 // processAck processes an ack and if needed sends more messages.
-func (s *StanServer) processAck(c *channel, sub *subState, sequence uint64) {
-	if sub == nil {
+func (s *StanServer) processAck(c *channel, ackSub *subState, sequence uint64) {
+	if ackSub == nil {
 		return
 	}
 
-	var stalled bool
+	var sub *subState
 
 	// This is immutable, so can grab outside of sub's lock.
 	// If we have a queue group, we want to grab queue's lock before
 	// sub's lock.
-	qs := sub.qstate
+	qs := ackSub.qstate
 	if qs != nil {
 		qs.Lock()
+		sub = qs.sub
+	} else {
+		sub = ackSub
 	}
 
 	sub.Lock()
 
 	if s.trace {
+		// For tracing, use the ackSub info (for queue subs, it is different
+		// from the sub used to stored acks).
+		if ackSub != sub {
+			ackSub.RLock()
+		}
 		s.log.Tracef("[Client:%s] Processing ack for subid=%d, subject=%s, seq=%d",
-			sub.ClientID, sub.ID, sub.subject, sequence)
+			ackSub.ClientID, ackSub.ID, ackSub.subject, sequence)
+		if ackSub != sub {
+			ackSub.RUnlock()
+		}
 	}
 
 	if err := sub.store.AckSeqPending(sub.ID, sequence); err != nil {
+		if ackSub != sub {
+			ackSub.RLock()
+		}
 		s.log.Errorf("[Client:%s] Unable to persist ack for subid=%d, subject=%s, seq=%d, err=%v",
-			sub.ClientID, sub.ID, sub.subject, sequence, err)
+			ackSub.ClientID, ackSub.ID, ackSub.subject, sequence, err)
+		if ackSub != sub {
+			ackSub.RUnlock()
+		}
 		sub.Unlock()
 		if qs != nil {
 			qs.Unlock()
@@ -3481,27 +3501,18 @@ func (s *StanServer) processAck(c *channel, sub *subState, sequence uint64) {
 		return
 	}
 
+	stalled := sub.stalled
+
 	delete(sub.acksPending, sequence)
 	if sub.stalled && int32(len(sub.acksPending)) < sub.MaxInFlight {
-		// For queue, we must not check the queue stalled count here. The queue
-		// as a whole may not be stalled, yet, if this sub was stalled, it is
-		// not now since the pending acks is below MaxInflight. The server should
-		// try to send available messages.
-		// It works also if the queue *was* stalled (all members were stalled),
-		// then this member is no longer stalled, which release the queue.
-
-		// Trigger send of available messages by setting this to true.
-		stalled = true
-
 		// Clear the stalled flag from this sub
 		sub.stalled = false
-		// .. and update the queue's stalled members count if this is a queue sub.
-		if qs != nil && qs.stalledSubCount > 0 {
-			qs.stalledSubCount--
-		}
 	}
 	sub.Unlock()
 	if qs != nil {
+		// Also delete pending from other maps
+		delete(qs.ackToMember, sequence)
+		delete(qs.memberPendingAcks[ackSub.ID], sequence)
 		qs.Unlock()
 	}
 
@@ -3525,16 +3536,12 @@ func (s *StanServer) sendAvailableMessagesToQueue(c *channel, qs *queueState) {
 	}
 
 	qs.Lock()
-	if qs.newOnHold {
-		qs.Unlock()
-		return
-	}
-	for nextSeq := qs.lastSent + 1; qs.stalledSubCount < len(qs.subs); nextSeq++ {
-		nextMsg := s.getNextMsg(c, &nextSeq, &qs.lastSent)
+	for nextSeq := qs.sub.LastSent + 1; !qs.sub.stalled; nextSeq++ {
+		nextMsg := s.getNextMsg(c, &nextSeq, &qs.sub.LastSent)
 		if nextMsg == nil {
 			break
 		}
-		if _, sent, sendMore := s.sendMsgToQueueGroup(qs, nextMsg, honorMaxInFlight); !sent || !sendMore {
+		if sent, sendMore := s.sendMsgToQueueGroup(qs, nextMsg, honorMaxInFlight); !sent || !sendMore {
 			break
 		}
 	}
@@ -3549,7 +3556,7 @@ func (s *StanServer) sendAvailableMessages(c *channel, sub *subState) {
 		if nextMsg == nil {
 			break
 		}
-		if sent, sendMore := s.sendMsgToSub(sub, nextMsg, honorMaxInFlight); !sent || !sendMore {
+		if sent, sendMore := s.sendMsgToSub(sub, sub.ID, sub.ClientID, sub.Inbox, nextMsg, honorMaxInFlight); !sent || !sendMore {
 			break
 		}
 	}

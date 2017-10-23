@@ -538,6 +538,9 @@ func TestMonitorClientsz(t *testing.T) {
 		if _, err := sc.Subscribe("bar", func(_ *stan.Msg) {}); err != nil {
 			t.Fatalf("Unexpected error on subscribe: %v", err)
 		}
+		if _, err := sc.QueueSubscribe("foo", "bar", func(_ *stan.Msg) {}); err != nil {
+			t.Fatalf("Unexpected error on subscribe: %v", err)
+		}
 		scs = append(scs, sc)
 	}
 
@@ -666,8 +669,13 @@ func TestMonitorClientz(t *testing.T) {
 			t.Fatalf("Error on connect: %v", err)
 		}
 		defer sc.Close()
-		for i := 0; i < numSubs; i++ {
+		for i := 0; i < numSubs/2; i++ {
 			if _, err := sc.Subscribe("bar", func(_ *stan.Msg) {}); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+		}
+		for i := 0; i < numSubs/2; i++ {
+			if _, err := sc.QueueSubscribe("foo", "bar", func(_ *stan.Msg) {}); err != nil {
 				t.Fatalf("Unexpected error on subscribe: %v", err)
 			}
 		}
@@ -901,7 +909,7 @@ func TestMonitorChannelsWithSubsz(t *testing.T) {
 				}
 				for _, qsub := range ss.qsubs {
 					qsub.RLock()
-					subscriptions = append(subscriptions, getChannelSubs(qsub.subs)...)
+					subscriptions = append(subscriptions, getChannelSubs(qsub.members)...)
 					qsub.RUnlock()
 				}
 				ss.RUnlock()
@@ -1117,5 +1125,117 @@ func TestMonitorDurableSubs(t *testing.T) {
 			// There shouldn't be any sub now
 			getAndCheck(false, 0)
 		}
+	}
+}
+
+func TestMonitorDurableQueueGroup(t *testing.T) {
+	resetPreviousHTTPConnections()
+	s := runMonitorServer(t, GetDefaultOptions())
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	qsub1, err := sc.QueueSubscribe("foo", "bar", func(_ *stan.Msg) {},
+		stan.DurableName("dur"), stan.SetManualAckMode(), stan.MaxInflight(4))
+	if err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	// Create second member with higher MaxInflight, which should be ignored and
+	// set to the value that created the group (4). Same for AckWait
+	qsub2, err := sc.QueueSubscribe("foo", "bar", func(_ *stan.Msg) {},
+		stan.DurableName("dur"), stan.SetManualAckMode(), stan.MaxInflight(10),
+		stan.AckWait(80))
+	if err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		if err := sc.Publish("foo", []byte("hello")); err != nil {
+			t.Fatalf("Unexpected error on publish: %v", err)
+		}
+	}
+	resp, body := getBody(t, ChannelsPath+"?channel=foo&subs=1", expectedJSON)
+	defer resp.Body.Close()
+	channel := &Channelz{}
+	if err := json.Unmarshal(body, channel); err != nil {
+		t.Fatalf("Error unmarshalling: %v", err)
+	}
+	if numSubs := len(channel.Subscriptions); numSubs != 2 {
+		t.Fatalf("Expected 2 subscriptions, got %v", numSubs)
+	}
+	for _, sub := range channel.Subscriptions {
+		if sub.AckInbox == "" || sub.Inbox == "" {
+			t.Fatalf("Meta sub should have AckInbox and Inbox, got %v", sub)
+		}
+		if sub.QueueName != "dur:bar" {
+			t.Fatalf("Expected queue name to be %q, got %q", "dur:bar", sub.QueueName)
+		}
+		if !sub.IsDurable {
+			t.Fatal("Should be durable")
+		}
+		if sub.IsOffline {
+			t.Fatal("Should not be offline")
+		}
+		if sub.PendingCount != 2 {
+			t.Fatalf("Expected 2 pending count, got %v", sub.PendingCount)
+		}
+		if sub.LastSent != 0 {
+			t.Fatalf("Member's LastSent is not expected to be set, got %v", sub.LastSent)
+		}
+		if sub.MaxInflight != 4 {
+			t.Fatalf("Member's MaxInflight should be 4, same than the group, got %v", sub.MaxInflight)
+		}
+		if sub.AckWait != 30 {
+			t.Fatalf("Member's AckWait should be 30, same than the group, got %v", sub.AckWait)
+		}
+		if sub.IsStalled {
+			t.Fatal("Member's IsStalled is not expected to be set")
+		}
+	}
+	if err := qsub1.Close(); err != nil {
+		t.Fatalf("Error closing queue member: %v", err)
+	}
+	if err := qsub2.Close(); err != nil {
+		t.Fatalf("Error closing queue member: %v", err)
+	}
+	resp.Body.Close()
+	// Since this is a durable queue group, we should have the
+	// group's meta sub with no AckInbox and Inbox and pending count should be 4
+	resp, body = getBody(t, ChannelsPath+"?channel=foo&subs=1", expectedJSON)
+	defer resp.Body.Close()
+	channel = &Channelz{}
+	if err := json.Unmarshal(body, channel); err != nil {
+		t.Fatalf("Error unmarshalling: %v", err)
+	}
+	if numSubs := len(channel.Subscriptions); numSubs != 1 {
+		t.Fatalf("Expected the meta subscription, got %v", numSubs)
+	}
+	sub := channel.Subscriptions[0]
+	if sub.AckInbox != "" || sub.Inbox != "" {
+		t.Fatalf("Meta sub should not have AckInbox or Inbox, got %v", sub)
+	}
+	if sub.QueueName != "dur:bar" {
+		t.Fatalf("Expected queue name to be %q, got %q", "dur:bar", sub.QueueName)
+	}
+	if !sub.IsDurable {
+		t.Fatal("Should be durable")
+	}
+	if !sub.IsOffline {
+		t.Fatal("Should be offline")
+	}
+	if sub.PendingCount != 4 {
+		t.Fatalf("Expected 4 pending count, got %v", sub.PendingCount)
+	}
+	if sub.LastSent != 4 {
+		t.Fatalf("LastSent for group should be 4, got %v", sub.LastSent)
+	}
+	if sub.MaxInflight != 4 {
+		t.Fatalf("Member's MaxInflight should be 4, same than the group, got %v", sub.MaxInflight)
+	}
+	if sub.AckWait != 30 {
+		t.Fatalf("Member's AckWait should be 30, same than the group, got %v", sub.AckWait)
+	}
+	if !sub.IsStalled {
+		t.Fatal("Queue should be stalled")
 	}
 }

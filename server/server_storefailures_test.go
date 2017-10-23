@@ -111,25 +111,31 @@ func TestStartPositionFailures(t *testing.T) {
 	mms.fail = true
 	mms.Unlock()
 
-	// New only
-	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
-		t.Fatalf("Not failed as expected: %v", err)
-	}
-	// Last received
-	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.StartWithLastReceived()); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
-		t.Fatalf("Not failed as expected: %v", err)
-	}
-	// Time delta
-	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.StartAtTimeDelta(time.Second)); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
-		t.Fatalf("Not failed as expected: %v", err)
-	}
-	// Sequence start
-	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.StartAtSequence(1)); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
-		t.Fatalf("Not failed as expected: %v", err)
-	}
-	// First
-	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.StartAt(pb.StartPosition_First)); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
-		t.Fatalf("Not failed as expected: %v", err)
+	queues := []string{"", "bar"}
+	for _, q := range queues {
+		// Take advantage of the QueueSubscribe() API that creates regular
+		// subscription if second parameter is empty string.
+
+		// New only
+		if _, err := sc.QueueSubscribe("foo", q, func(_ *stan.Msg) {}); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
+			t.Fatalf("Not failed as expected: %v", err)
+		}
+		// Last received
+		if _, err := sc.QueueSubscribe("foo", q, func(_ *stan.Msg) {}, stan.StartWithLastReceived()); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
+			t.Fatalf("Not failed as expected: %v", err)
+		}
+		// Time delta
+		if _, err := sc.QueueSubscribe("foo", q, func(_ *stan.Msg) {}, stan.StartAtTimeDelta(time.Second)); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
+			t.Fatalf("Not failed as expected: %v", err)
+		}
+		// Sequence start
+		if _, err := sc.QueueSubscribe("foo", q, func(_ *stan.Msg) {}, stan.StartAtSequence(1)); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
+			t.Fatalf("Not failed as expected: %v", err)
+		}
+		// First
+		if _, err := sc.QueueSubscribe("foo", q, func(_ *stan.Msg) {}, stan.StartAt(pb.StartPosition_First)); err == nil || !strings.Contains(err.Error(), errOnPurpose.Error()) {
+			t.Fatalf("Not failed as expected: %v", err)
+		}
 	}
 }
 
@@ -235,55 +241,16 @@ func TestMsgLookupFailures(t *testing.T) {
 	mms.fail = false
 	mms.Unlock()
 	sub.Unsubscribe()
+}
 
-	// Check that removal of qsub with pending message
-
-	// One queue member receives and acks
-	if _, err := sc.QueueSubscribe("bar", "queue", func(_ *stan.Msg) {}); err != nil {
-		t.Fatalf("Error on subscribe: %v", err)
+func (ss *mockedSubStore) CreateSub(sub *spb.SubState) error {
+	ss.RLock()
+	fail := ss.fail
+	ss.RUnlock()
+	if fail {
+		return fmt.Errorf("On purpose")
 	}
-	// Another member does not ack.
-	qsub2, err := sc.QueueSubscribe("bar", "queue", func(_ *stan.Msg) {
-		rcvCh <- true
-	}, stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(15)))
-	if err != nil {
-		t.Fatalf("Error on subscribe: %v", err)
-	}
-
-	cs = channelsGet(t, s.channels, "bar")
-	mms = cs.store.Msgs.(*mockedMsgStore)
-
-	// Publish messages until qsub2 receives one
-forLoop:
-	for {
-		if err := sc.Publish("bar", []byte("hello")); err != nil {
-			t.Fatalf("Error on publish: %v", err)
-		}
-		select {
-		case <-rcvCh:
-			break forLoop
-		case <-time.After(500 * time.Millisecond):
-			// send a new message
-		}
-	}
-	// Activate store failures
-	mms.Lock()
-	mms.fail = true
-	logger.Lock()
-	logger.checkErrorStr = "Unable to update subscription"
-	logger.gotError = false
-	logger.Unlock()
-	mms.Unlock()
-	// Close qsub2, server should try to move unack'ed message to qsub1
-	if err := qsub2.Close(); err != nil {
-		t.Fatalf("Error closing qsub: %v", err)
-	}
-	logger.Lock()
-	gotErr = logger.gotError
-	logger.Unlock()
-	if !gotErr {
-		t.Fatalf("Did not capture error about updating subscription")
-	}
+	return ss.SubStore.CreateSub(sub)
 }
 
 func (ss *mockedSubStore) AddSeqPending(subid, seq uint64) error {
@@ -314,6 +281,67 @@ func (ss *mockedSubStore) DeleteSub(subid uint64) error {
 		return fmt.Errorf("On purpose")
 	}
 	return ss.SubStore.DeleteSub(subid)
+}
+
+func TestCreateSubFailures(t *testing.T) {
+	logger := &checkErrorLogger{checkErrorStr: "store subscription"}
+	opts := GetDefaultOptions()
+	opts.CustomLogger = logger
+	s, err := RunServerWithOpts(opts, nil)
+	if err != nil {
+		t.Fatalf("Error running server: %v", err)
+	}
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	waitForNumClients(t, s, 1)
+
+	s.channels.Lock()
+	s.channels.store = &mockedStore{Store: s.channels.store}
+	s.channels.Unlock()
+
+	c := channelsLookupOrCreate(t, s, "foo")
+	mss := c.store.Subs.(*mockedSubStore)
+	mss.Lock()
+	mss.fail = true
+	mss.Unlock()
+
+	// Check that server reported an error
+	checkError := func() {
+		logger.Lock()
+		gotIt := logger.gotError
+		logger.gotError = false
+		logger.Unlock()
+		if !gotIt {
+			stackFatalf(t, "Server did not log expected error")
+		}
+	}
+
+	// Create a plain sub
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err == nil {
+		t.Fatal("Expected subscribe to fail")
+	}
+	checkError()
+
+	// Create a durable
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur")); err == nil {
+		t.Fatal("Expected subscribe to fail")
+	}
+	checkError()
+
+	// Create a queue sub
+	if _, err := sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}); err == nil {
+		t.Fatal("Expected subscribe to fail")
+	}
+	checkError()
+
+	// Create a durable queue sub with manual ack and does not ack message
+	if _, err := sc.QueueSubscribe("foo", "dqueue", func(_ *stan.Msg) {}, stan.DurableName("dur")); err == nil {
+		t.Fatal("Expected subscribe to fail")
+	}
+	checkError()
 }
 
 func TestDeleteSubFailures(t *testing.T) {
@@ -410,13 +438,8 @@ func TestDeleteSubFailures(t *testing.T) {
 	waitForNumSubs(t, s, clientName, 2)
 	checkError()
 
-	// Now check that when closing qsub1 that has an unack message,
-	// server logs an error when trying to move the message to remaining
-	// queue member
-	logger.Lock()
-	logger.checkErrorStr = "transfer message"
-	logger.Unlock()
-	if err := dqsub1.Close(); err != nil {
+	// Unsubscribe last durable queue member.
+	if err := dqsub1.Unsubscribe(); err != nil {
 		t.Fatalf("Error on close: %v", err)
 	}
 	// Wait for close to be processed
