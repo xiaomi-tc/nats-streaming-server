@@ -86,6 +86,24 @@
 			"notests": true
 		},
 		{
+			"importpath": "golang.org/x/crypto/chacha20poly1305",
+			"repository": "https://go.googlesource.com/crypto",
+			"vcs": "git",
+			"revision": "94eea52f7b742c7cbe0b03b22f0c4c8631ece122",
+			"branch": "master",
+			"path": "/chacha20poly1305",
+			"notests": true
+		},
+		{
+			"importpath": "golang.org/x/crypto/poly1305",
+			"repository": "https://go.googlesource.com/crypto",
+			"vcs": "git",
+			"revision": "94eea52f7b742c7cbe0b03b22f0c4c8631ece122",
+			"branch": "master",
+			"path": "poly1305",
+			"notests": true
+		},
+		{
 			"importpath": "google.golang.org/appengine/cloudsql",
 			"repository": "https://github.com/golang/appengine",
 			"vcs": "git",
