@@ -44,6 +44,8 @@ var (
 	errOnPurpose        = errors.New("On purpose")
 	benchStoreType      = stores.TypeMemory
 	persistentStoreType = stores.TypeFile
+	testUseEncryption   bool
+	testEncryptionKey   = "testkey"
 )
 
 // The SourceAdmin is used by the test setup to have access
@@ -75,6 +77,8 @@ func TestMain(m *testing.M) {
 	)
 	flag.StringVar(&bst, "bench_store", "", "store type for bench tests (mem, file)")
 	flag.StringVar(&pst, "persistent_store", "", "store type for server recovery related tests (file)")
+	flag.BoolVar(&testUseEncryption, "encryption", false, "use encryption")
+	flag.StringVar(&testEncryptionKey, "encryption_key", testEncryptionKey, "encryption key")
 	test.AddSQLFlags(flag.CommandLine, &testSQLDriver, &testSQLSource, &testSQLSourceAdmin, &testSQLDatabaseName)
 	flag.Parse()
 	bst = strings.ToUpper(bst)
@@ -392,6 +396,13 @@ func WaitTime(ch chan bool, timeout time.Duration) error {
 }
 
 func runServerWithOpts(t *testing.T, sOpts *Options, nOpts *natsd.Options) *StanServer {
+	if testUseEncryption {
+		if sOpts == nil {
+			sOpts = GetDefaultOptions()
+		}
+		sOpts.Encryption = true
+		sOpts.EncryptionKey = testEncryptionKey
+	}
 	s, err := RunServerWithOpts(sOpts, nOpts)
 	if err != nil {
 		stackFatalf(t, err.Error())

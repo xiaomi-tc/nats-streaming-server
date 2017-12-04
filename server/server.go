@@ -829,6 +829,8 @@ type Options struct {
 	AckSubsPoolSize    int           // Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription).
 	FTGroupName        string        // Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
 	Partitioning       bool          // Specify if server only accepts messages/subscriptions on channels defined in StoreLimits.
+	Encryption         bool          // Specify if server should use encryption at rest
+	EncryptionKey      string        // Key for the encryption. If not specified, will look for NATS_STREAMING_ENCRYPTION_KEY environment variable.
 }
 
 // Clone returns a deep copy of the Options object.
@@ -1130,6 +1132,12 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 	}
 	if err != nil {
 		return nil, err
+	}
+	if sOpts.Encryption {
+		store, err = stores.NewCryptoStore(store, sOpts.EncryptionKey)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// StanServer.store (s.store here) is of type stores.Store, which is an
 	// interface. If we assign s.store in the call of the constructor and there

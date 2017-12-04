@@ -832,6 +832,8 @@ Streaming Server Options:
     -hbf, --hb_fail_count <int>      Number of failed heartbeats before server closes the client connection
           --ack_subs <int>           Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription)
           --ft_group <string>        Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
+          --encryption <bool>        Specify if server should use encryption at rest
+          --encryption_key <sting>   Key for the encryption. If not specified, will look for NATS_STREAMING_ENCRYPTION_KEY environment variable
 
 Streaming Server File Store Options:
     --file_compact_enabled <bool>        Enable file compaction
@@ -974,6 +976,8 @@ In general the configuration parameters are the same as the command line argumen
 | ack_subs_pool_size | Normally, when a client creates a subscription, the server creates an internal subscription to receive its ACKs. If lots of subscriptions are created, the number of internal subscriptions in the server could be very high. To curb this growth, use this parameter to configure a pool of internal ACKs subscriptions | Number | `ack_subs_pool_size: 10` |
 | ft_group | In Fault Tolerance mode, you can start a group of streaming servers with only one server being active while others are running in standby mode. This is the name of this FT group | String | `ft_group: "my_ft_group"` |
 | partitioning | If set to true, a list of channels must be defined in store_limits/channels section. This section then serves two purposes, overriding limits for a given channel or adding it to the partition | `true` or `false` | `partitioning: true` |
+| encryption | Specify if server should use encryption at rest. Note that only messages payload are encrypted | `true` or `false` | `encryption: true` |
+| encryption_key | Key for the encryption. If not specified, will look for NATS_STREAMING_ENCRYPTION_KEY environment variable | String | `encryption_key: "mykey"` |
 
 TLS Configuration:
 

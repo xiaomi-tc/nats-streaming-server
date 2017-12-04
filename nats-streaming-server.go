@@ -30,7 +30,9 @@ Streaming Server Options:
     -hbt, --hb_timeout <duration>    How long server waits for a heartbeat response
     -hbf, --hb_fail_count <int>      Number of failed heartbeats before server closes the client connection
           --ack_subs <int>           Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription)
-          --ft_group <string>        Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
+          --ft_group <string>        Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore
+          --encryption <bool>        Specify if server should use encryption at rest
+          --encryption_key <sting>   Key for the encryption. If not specified, will look for NATS_STREAMING_ENCRYPTION_KEY environment variable
 
 Streaming Server File Store Options:
     --file_compact_enabled <bool>        Enable file compaction

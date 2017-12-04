@@ -144,6 +144,16 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				return err
 			}
 			opts.Partitioning = v.(bool)
+		case "encryption":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Encryption = v.(bool)
+		case "encryption_key":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.EncryptionKey = v.(string)
 		}
 	}
 	return nil
@@ -475,6 +485,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&sopts.SQLStoreOpts.Source, "sql_source", "", "SQL Data Source")
 	fs.BoolVar(&sopts.SQLStoreOpts.NoCaching, "sql_no_caching", false, "Enable/Disable caching")
 	fs.IntVar(&sopts.SQLStoreOpts.MaxOpenConns, "sql_max_open_conns", 0, "Max opened connections to the database")
+	fs.BoolVar(&sopts.Encryption, "encryption", false, "Specify if server should use encryption at rest")
+	fs.StringVar(&sopts.EncryptionKey, "encryption_key", "", "Key for the encryption. If not specified, will look for NATS_STREAMING_ENCRYPTION_KEY environment variable")
 
 	// First, we need to call NATS's ConfigureOptions() with above flag set.
 	// It will be augmented with NATS specific flags and call fs.Parse(args) for us.
