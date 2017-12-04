@@ -635,7 +635,8 @@ func TestPersistentStoreMultipleShadowQSubs(t *testing.T) {
 	limits := stores.DefaultStoreLimits
 	switch persistentStoreType {
 	case stores.TypeFile:
-		store, err = stores.NewFileStore(testLogger, defaultDataStore, &limits)
+		store, err = stores.NewFileStore(testLogger, defaultDataStore, &limits,
+			stores.FileStoreEncryption(testUseEncryption, testEncryptionKey))
 	case stores.TypeSQL:
 		store, err = stores.NewSQLStore(testLogger, testSQLDriver, testSQLSource, &limits)
 	}

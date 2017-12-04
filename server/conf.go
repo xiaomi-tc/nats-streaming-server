@@ -368,6 +368,16 @@ func parseFileOptions(itf interface{}, opts *Options) error {
 				return err
 			}
 			opts.FileStoreOpts.ParallelRecovery = int(v.(int64))
+		case "encryption":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.FileStoreOpts.Encryption = v.(bool)
+		case "encryption_key":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.FileStoreOpts.EncryptionKey = v.(string)
 		}
 	}
 	return nil
@@ -468,6 +478,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&sopts.FileStoreOpts.SliceArchiveScript, "file_slice_archive_script", "", "stan.FileStoreOpts.SliceArchiveScript")
 	fs.Int64Var(&sopts.FileStoreOpts.FileDescriptorsLimit, "file_fds_limit", stores.DefaultFileStoreOptions.FileDescriptorsLimit, "stan.FileStoreOpts.FileDescriptorsLimit")
 	fs.IntVar(&sopts.FileStoreOpts.ParallelRecovery, "file_parallel_recovery", stores.DefaultFileStoreOptions.ParallelRecovery, "stan.FileStoreOpts.ParallelRecovery")
+	fs.BoolVar(&sopts.FileStoreOpts.Encryption, "file_encryption", stores.DefaultFileStoreOptions.Encryption, "Use file encryption")
+	fs.StringVar(&sopts.FileStoreOpts.EncryptionKey, "file_encryption_key", stores.DefaultFileStoreOptions.EncryptionKey, "Encryption key")
 	fs.IntVar(&sopts.IOBatchSize, "io_batch_size", DefaultIOBatchSize, "stan.IOBatchSize")
 	fs.Int64Var(&sopts.IOSleepTime, "io_sleep_time", DefaultIOSleepTime, "stan.IOSleepTime")
 	fs.StringVar(&sopts.FTGroupName, "ft_group", "", "stan.FTGroupName")

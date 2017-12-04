@@ -192,7 +192,11 @@ func TestFSStoreMsgCausesFlush(t *testing.T) {
 	cleanupFSDatastore(t)
 	defer cleanupFSDatastore(t)
 
-	fs := createDefaultFileStore(t, BufferSize(50))
+	bufSize := 50
+	if testFSUseEncryption {
+		bufSize = 100
+	}
+	fs := createDefaultFileStore(t, BufferSize(bufSize))
 	defer fs.Close()
 
 	cs := storeCreateChannel(t, fs, "foo")
@@ -202,8 +206,8 @@ func TestFSStoreMsgCausesFlush(t *testing.T) {
 	buffered := ms.bw.buf.Buffered()
 	bufferedMsgs := len(ms.bufferedMsgs)
 	ms.RUnlock()
-	if buffered != m1.Size()+recordHeaderSize {
-		t.Fatalf("Expected buffered to be %v, got %v", m1.Size()+recordHeaderSize, buffered)
+	if buffered != m1.Size()+fs.recordOverhead() {
+		t.Fatalf("Expected buffered to be %v, got %v", m1.Size()+fs.recordOverhead(), buffered)
 	}
 	if bufferedMsgs != 1 {
 		t.Fatalf("Expected 1 buffered message, got %v", bufferedMsgs)
@@ -214,8 +218,8 @@ func TestFSStoreMsgCausesFlush(t *testing.T) {
 	buffered = ms.bw.buf.Buffered()
 	bufferedMsgs = len(ms.bufferedMsgs)
 	ms.RUnlock()
-	if buffered != m2.Size()+recordHeaderSize {
-		t.Fatalf("Expected buffered to be %v, got %v", m2.Size()+recordHeaderSize, buffered)
+	if buffered != m2.Size()+fs.recordOverhead() {
+		t.Fatalf("Expected buffered to be %v, got %v", m2.Size()+fs.recordOverhead(), buffered)
 	}
 	if bufferedMsgs != 1 {
 		t.Fatalf("Expected 1 buffered message, got %v", bufferedMsgs)
@@ -288,7 +292,8 @@ func TestFSNoPanicAfterRestartWithSmallerLimits(t *testing.T) {
 	fs.Close()
 
 	limit.MaxMsgs = 10
-	fs, err = NewFileStore(testLogger, testFSDefaultDatastore, &limit)
+	fs, err = NewFileStore(testLogger, testFSDefaultDatastore, &limit,
+		FileStoreEncryption(testFSUseEncryption, testFSEncryptionKey))
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}

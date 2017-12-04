@@ -14,6 +14,7 @@ go test -covermode=atomic -coverprofile=./cov/stores5.out -run=TestCS/FILE ./sto
 go test -covermode=atomic -coverprofile=./cov/stores6.out -run=TestFS ./stores -fs_no_buffer
 go test -covermode=atomic -coverprofile=./cov/stores7.out -run=TestFS ./stores -fs_set_fds_limit
 go test -covermode=atomic -coverprofile=./cov/stores8.out -run=TestFS ./stores -fs_no_buffer -fs_set_fds_limit
+go test -covermode=atomic -coverprofile=./cov/stores9.out -run=TestFS ./stores -encryption
 go test -covermode=atomic -coverprofile=./cov/util.out ./util
 gocovmerge ./cov/*.out > acc.out
 rm -rf ./cov

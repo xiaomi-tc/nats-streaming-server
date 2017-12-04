@@ -307,6 +307,8 @@ func TestMain(m *testing.M) {
 	flag.BoolVar(&testFSDisableBufferWriters, "fs_no_buffer", false, "Disable use of buffer writers")
 	flag.BoolVar(&testFSSetFDsLimit, "fs_set_fds_limit", false, "Set some FDs limit")
 	flag.BoolVar(&doSQL, "sql", true, "Set this to false if you don't want SQL to be tested")
+	flag.BoolVar(&testFSUseEncryption, "encryption", testFSUseEncryption, "Use encryption")
+	flag.StringVar(&testFSEncryptionKey, "encryption_key", testFSEncryptionKey, "Encryption key")
 	test.AddSQLFlags(flag.CommandLine, &testSQLDriver, &testSQLSource, &testSQLSourceAdmin, &testSQLDatabaseName)
 	flag.Parse()
 

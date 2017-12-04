@@ -25,6 +25,7 @@ var (
 	ErrTooManySubs     = errors.New("too many subscriptions per channel")
 	ErrNotSupported    = errors.New("not supported")
 	ErrAlreadyExists   = errors.New("already exists")
+	ErrNoEncryptionKey = errors.New("encryption key must be specified")
 )
 
 // StoreLimits define limits for a store.

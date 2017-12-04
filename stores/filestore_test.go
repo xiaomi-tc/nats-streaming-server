@@ -28,6 +28,8 @@ var (
 	testFSDefaultDatastore     string
 	testFSDisableBufferWriters bool
 	testFSSetFDsLimit          bool
+	testFSUseEncryption        bool
+	testFSEncryptionKey        = "testkey"
 )
 
 var testFDsLimit = int64(5)
@@ -58,6 +60,10 @@ func newFileStore(t tLogger, dataStore string, limits *StoreLimits, options ...F
 	}
 	if testFSSetFDsLimit {
 		opts.FileDescriptorsLimit = testFDsLimit
+	}
+	if testFSUseEncryption {
+		opts.Encryption = true
+		opts.EncryptionKey = testFSEncryptionKey
 	}
 	// Apply the provided options
 	for _, opt := range options {
@@ -104,7 +110,8 @@ func openDefaultFileStoreWithLimits(t tLogger, limits *StoreLimits, options ...F
 
 func expectedErrorOpeningDefaultFileStore(t *testing.T) error {
 	limits := testDefaultStoreLimits
-	fs, err := NewFileStore(testLogger, testFSDefaultDatastore, &limits)
+	fs, err := NewFileStore(testLogger, testFSDefaultDatastore, &limits,
+		FileStoreEncryption(testFSUseEncryption, testFSEncryptionKey))
 	if err == nil {
 		_, err = fs.Recover()
 		fs.Close()
@@ -529,6 +536,10 @@ func TestFSOptions(t *testing.T) {
 	if testFSSetFDsLimit {
 		expected.FileDescriptorsLimit = testFDsLimit
 	}
+	if testFSUseEncryption {
+		expected.Encryption = true
+		expected.EncryptionKey = testFSEncryptionKey
+	}
 	checkOpts(expected, opts)
 
 	cs := storeCreateChannel(t, fs, "foo")
@@ -559,6 +570,8 @@ func TestFSOptions(t *testing.T) {
 		SliceArchiveScript:   "myscript.sh",
 		FileDescriptorsLimit: 20,
 		ParallelRecovery:     5,
+		Encryption:           true,
+		EncryptionKey:        "ivan",
 	}
 	// Create the file with custom options
 	fs, err := NewFileStore(testLogger, testFSDefaultDatastore, &testDefaultStoreLimits,
@@ -572,7 +585,8 @@ func TestFSOptions(t *testing.T) {
 		DoSync(expected.DoSync),
 		SliceConfig(100, 1024*1024, time.Second, "myscript.sh"),
 		FileDescriptorsLimit(20),
-		ParallelRecovery(5))
+		ParallelRecovery(5),
+		FileStoreEncryption(true, "ivan"))
 	if err != nil {
 		t.Fatalf("Unexpected error on file store create: %v", err)
 	}
@@ -922,7 +936,7 @@ func TestFSBadClientFile(t *testing.T) {
 	//
 	file = resetToValidFile()
 	// First write a valid addClient
-	writeRecord(file, nil, addClient, &cli, cli.Size(), crc32.IEEETable)
+	fs.writeRecord(file, nil, addClient, &cli, cli.Size())
 	// Then write an invalid delClient
 	delCli := spb.ClientDelete{ID: clientID}
 	b, _ = delCli.Marshal()
@@ -1366,10 +1380,20 @@ func TestFSReadRecord(t *testing.T) {
 	recType := recNoType
 	recSize := 0
 
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	// Don't use encryption here...
+	fs, err := NewFileStore(testLogger, testFSDefaultDatastore, nil)
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer fs.Close()
+
 	// Reader returns an error
 	errReturned := fmt.Errorf("Fake error")
 	r.setErrToReturn(errReturned)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true)
+	retBuf, _, recSize, recType, err = fs.readRecord(r, buf, false, crc32.IEEETable, true)
 	if err != errReturned {
 		t.Fatalf("Expected error %v, got: %v", errReturned, err)
 	}
@@ -1389,7 +1413,7 @@ func TestFSReadRecord(t *testing.T) {
 	util.ByteOrder.PutUint32(header, 0)
 	r.setErrToReturn(nil)
 	r.setContent(header)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true)
+	retBuf, _, recSize, recType, err = fs.readRecord(r, buf, false, crc32.IEEETable, true)
 	if err == nil {
 		t.Fatal("Expected error got none")
 	}
@@ -1409,7 +1433,7 @@ func TestFSReadRecord(t *testing.T) {
 	copy(b[recordHeaderSize:], []byte("hello"))
 	r.setErrToReturn(nil)
 	r.setContent(b)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true)
+	retBuf, _, recSize, recType, err = fs.readRecord(r, buf, false, crc32.IEEETable, true)
 	if err == nil {
 		t.Fatal("Expected error got none")
 	}
@@ -1424,7 +1448,7 @@ func TestFSReadRecord(t *testing.T) {
 	}
 	// Not asking for CRC should return ok
 	r.setContent(b)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, false)
+	retBuf, _, recSize, recType, err = fs.readRecord(r, buf, false, crc32.IEEETable, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1446,7 +1470,7 @@ func TestFSReadRecord(t *testing.T) {
 	copy(b[recordHeaderSize:], payload)
 	r.setErrToReturn(nil)
 	r.setContent(b)
-	retBuf, recSize, recType, err = readRecord(r, buf, false, crc32.IEEETable, true)
+	retBuf, _, recSize, recType, err = fs.readRecord(r, buf, false, crc32.IEEETable, true)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1464,7 +1488,7 @@ func TestFSReadRecord(t *testing.T) {
 	util.ByteOrder.PutUint32(b, 1<<24|10) // reuse previous buf
 	r.setErrToReturn(nil)
 	r.setContent(b)
-	retBuf, recSize, recType, err = readRecord(r, buf, true, crc32.IEEETable, true)
+	retBuf, _, recSize, recType, err = fs.readRecord(r, buf, true, crc32.IEEETable, true)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1514,6 +1538,7 @@ func (r *recordProduceErrorOnMarshal) MarshalTo(b []byte) (int, error) {
 
 func TestFSWriteRecord(t *testing.T) {
 	w := &testWriter{}
+	fs := &FileStore{crcTable: crc32.IEEETable}
 
 	var err error
 
@@ -1524,7 +1549,7 @@ func TestFSWriteRecord(t *testing.T) {
 	cli := &spb.ClientInfo{ID: "me", HbInbox: "inbox"}
 	cliBuf, _ := cli.Marshal()
 
-	retBuf, size, err = writeRecord(w, buf, addClient, cli, cli.Size(), crc32.IEEETable)
+	retBuf, size, err = fs.writeRecord(w, buf, addClient, cli, cli.Size())
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1549,7 +1574,7 @@ func TestFSWriteRecord(t *testing.T) {
 
 	// Check with no type
 	w.reset()
-	retBuf, size, err = writeRecord(w, buf, recNoType, cli, cli.Size(), crc32.IEEETable)
+	retBuf, size, err = fs.writeRecord(w, buf, recNoType, cli, cli.Size())
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1576,7 +1601,7 @@ func TestFSWriteRecord(t *testing.T) {
 	w.reset()
 	errReturned := fmt.Errorf("Fake error")
 	corruptRec := &recordProduceErrorOnMarshal{errToReturn: errReturned}
-	retBuf, size, err = writeRecord(w, buf, recNoType, corruptRec, corruptRec.Size(), crc32.IEEETable)
+	retBuf, size, err = fs.writeRecord(w, buf, recNoType, corruptRec, corruptRec.Size())
 	if err != errReturned {
 		t.Fatalf("Expected error %v, got %v", errReturned, err)
 	}
@@ -1589,6 +1614,7 @@ func TestFSWriteRecord(t *testing.T) {
 }
 
 func TestFSNoPartialWriteDueToBuffering(t *testing.T) {
+	fs := &FileStore{crcTable: crc32.IEEETable}
 	// We could use any record type here, using MsgProto
 	m1 := &pb.MsgProto{Sequence: 1, Subject: "foo", Data: []byte("msg1")}
 	m2 := &pb.MsgProto{Sequence: 2, Subject: "foo", Data: []byte("msg2")}
@@ -1598,9 +1624,9 @@ func TestFSNoPartialWriteDueToBuffering(t *testing.T) {
 	bw := bufio.NewWriterSize(w, size)
 
 	// Write first record
-	m1buf, _, _ := writeRecord(bw, nil, recNoType, m1, m1.Size(), crc32.IEEETable)
+	m1buf, _, _ := fs.writeRecord(bw, nil, recNoType, m1, m1.Size())
 	// Now add m2
-	writeRecord(bw, nil, recNoType, m2, m2.Size(), crc32.IEEETable)
+	fs.writeRecord(bw, nil, recNoType, m2, m2.Size())
 	// Check that w's buf only contains m2 (no partial)
 	if bw.Buffered() != m2.Size()+recordHeaderSize {
 		t.Fatalf("Expected buffer to contain %v bytes, got %v", m2.Size()+recordHeaderSize, bw.Buffered())
@@ -1616,9 +1642,9 @@ func TestFSNoPartialWriteDueToBuffering(t *testing.T) {
 	errThrown := fmt.Errorf("On purpose")
 	w.setErrToReturn(errThrown)
 	// Write first record
-	writeRecord(bw, nil, recNoType, m1, m1.Size(), crc32.IEEETable)
+	fs.writeRecord(bw, nil, recNoType, m1, m1.Size())
 	// Now add m2
-	_, _, err := writeRecord(bw, nil, recNoType, m2, m2.Size(), crc32.IEEETable)
+	_, _, err := fs.writeRecord(bw, nil, recNoType, m2, m2.Size())
 	if err != errThrown {
 		t.Fatalf("Expected error %v, got %v", errThrown, err)
 	}
@@ -1776,4 +1802,25 @@ func TestFSFilesClosedOnRecovery(t *testing.T) {
 		}
 	}
 	s.fm.Unlock()
+}
+
+func TestFSEncryptionKey(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	os.Unsetenv(FileStoreEnvEncryptionKey)
+	defer os.Unsetenv(FileStoreEnvEncryptionKey)
+
+	s, err := NewFileStore(testLogger, testFSDefaultDatastore, nil, FileStoreEncryption(true, ""))
+	if s != nil || err == nil {
+		if s != nil {
+			s.Close()
+		}
+		t.Fatalf("Expected no store and error, got %v and %v", s, err)
+	}
+
+	// Use env variable
+	os.Setenv(FileStoreEnvEncryptionKey, "ivan")
+	s = createDefaultFileStore(t, FileStoreEncryption(true, ""))
+	s.Close()
 }

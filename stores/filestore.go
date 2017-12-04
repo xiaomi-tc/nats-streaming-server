@@ -4,6 +4,9 @@ package stores
 
 import (
 	"bufio"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -21,6 +24,13 @@ import (
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/util"
+	"golang.org/x/crypto/chacha20poly1305"
+)
+
+const (
+	// FileStoreEnvEncryptionKey is the variable name for the encryption key
+	// (if not specified as an option when creating the store)
+	FileStoreEnvEncryptionKey = "NATS_STREAMING_ENCRYPTION_KEY"
 )
 
 const (
@@ -60,7 +70,7 @@ const (
 	// defaultBufSize is used for various buffered IO operations
 	defaultBufSize = 10 * 1024 * 1024
 
-	// Size of an message index record
+	// Size of a message index record
 	// Seq - Offset - Timestamp - Size - CRC
 	msgIndexRecSize = 8 + 8 + 8 + 4 + crcSize
 
@@ -162,6 +172,14 @@ type FileStoreOptions struct {
 
 	// Number of channels recovered in parallel (default is 1).
 	ParallelRecovery int
+
+	// Specify if records should be stored using encryption.
+	Encryption bool
+
+	// If encryption is enabled, this is the key used to encrypt data.
+	// If the key is empty, the environment variable NATS_STREAMING_ENCRYPTION_KEY
+	// is used.
+	EncryptionKey string
 }
 
 // DefaultFileStoreOptions defines the default options for a File Store.
@@ -310,6 +328,15 @@ func ParallelRecovery(count int) FileStoreOption {
 	}
 }
 
+// FileStoreEncryption is a FileStore option that configures the encryption.
+func FileStoreEncryption(enabled bool, key string) FileStoreOption {
+	return func(o *FileStoreOptions) error {
+		o.Encryption = enabled
+		o.EncryptionKey = key
+		return nil
+	}
+}
+
 // AllOptions is a convenient option to pass all options from a FileStoreOptions
 // structure to the constructor.
 func AllOptions(opts *FileStoreOptions) FileStoreOption {
@@ -341,6 +368,8 @@ func AllOptions(opts *FileStoreOptions) FileStoreOption {
 		o.CompactEnabled = opts.CompactEnabled
 		o.DoCRC = opts.DoCRC
 		o.DoSync = opts.DoSync
+		o.Encryption = opts.Encryption
+		o.EncryptionKey = opts.EncryptionKey
 		return nil
 	}
 }
@@ -429,6 +458,12 @@ type FileStore struct {
 	cliCompactTS  time.Time
 	crcTable      *crc32.Table
 	lockFile      util.LockFile
+
+	// Crypto specific fields
+	gcm            cipher.AEAD
+	nonce          []byte
+	nonceSize      int
+	cryptoOverhead int
 }
 
 type subscription struct {
@@ -447,6 +482,7 @@ type bufferedWriter struct {
 // FileSubStore is a subscription store in files.
 type FileSubStore struct {
 	genericSubStore
+	fstore      *FileStore // pointer to parent file store
 	fm          *filesManager
 	tmpSubBuf   []byte
 	file        *file
@@ -628,15 +664,32 @@ func checkFileVersion(r io.Reader) error {
 // The record layout is as follows:
 // 8 bytes: 4 bytes for type and/or size combined
 //          4 bytes for CRC-32
-// variable bytes: payload.
+// If crypto is used:
+// NonceSize bytes: the crypto nonce
+// variable bytes: payload (possibly including crypto overhead)
 // If a buffer is provided, this function uses it and expands it if necessary.
 // The function returns the buffer (possibly changed due to expansion) and the
 // number of bytes written into that buffer.
-func writeRecord(w io.Writer, buf []byte, recType recordType, rec record, recSize int, crcTable *crc32.Table) ([]byte, int, error) {
+func (fs *FileStore) writeRecord(w io.Writer, buf []byte, recType recordType, rec record, recSize int) ([]byte, int, error) {
+	// If crypto is used, fs.nonceSize is non zero, otherwise it is 0.
+	recordStart := recordHeaderSize + fs.nonceSize
+	// Alloc or realloc as needed (include possible crypto overhead)
+	buf = util.EnsureBufBigEnough(buf, recordHeaderSize+recSize+fs.cryptoOverhead)
+	// Marshal the record into the given buffer, after the header offset
+	if _, err := rec.MarshalTo(buf[recordStart:]); err != nil {
+		// Return the buffer because the caller may have provided one
+		return buf, 0, err
+	}
+	if fs.gcm != nil {
+		// First copy the nonce at the record header offset
+		copy(buf[recordHeaderSize:], fs.nonce)
+		// Seal the payload into the buffer at the start position
+		ret := fs.gcm.Seal(buf[recordStart:recordStart], fs.nonce, buf[recordStart:recordStart+recSize], nil)
+		// recSize includes the nonce and the encrypted payload
+		recSize = fs.nonceSize + len(ret)
+	}
 	// This is the header + payload size
 	totalSize := recordHeaderSize + recSize
-	// Alloc or realloc as needed
-	buf = util.EnsureBufBigEnough(buf, totalSize)
 	// If there is a record type, encode it
 	headerFirstInt := 0
 	if recType != recNoType {
@@ -651,13 +704,8 @@ func writeRecord(w io.Writer, buf []byte, recType recordType, rec record, recSiz
 	}
 	// Write the first part of the header at the beginning of the buffer
 	util.ByteOrder.PutUint32(buf[:4], uint32(headerFirstInt))
-	// Marshal the record into the given buffer, after the header offset
-	if _, err := rec.MarshalTo(buf[recordHeaderSize:totalSize]); err != nil {
-		// Return the buffer because the caller may have provided one
-		return buf, 0, err
-	}
 	// Compute CRC
-	crc := crc32.Checksum(buf[recordHeaderSize:totalSize], crcTable)
+	crc := crc32.Checksum(buf[recordHeaderSize:totalSize], fs.crcTable)
 	// Write it in the buffer
 	util.ByteOrder.PutUint32(buf[4:recordHeaderSize], crc)
 	// Are we dealing with a buffered writer?
@@ -679,15 +727,15 @@ func writeRecord(w io.Writer, buf []byte, recType recordType, rec record, recSiz
 }
 
 // readRecord reads a record from `r`, possibly checking the CRC-32 checksum.
-// When `buf`` is not nil, this function ensures the buffer is big enough to
+// When `buf` is not nil, this function ensures the buffer is big enough to
 // hold the payload (expanding if necessary). Therefore, this call always
 // return `buf`, regardless if there is an error or not.
 // The caller is indicating if the record is supposed to be typed or not.
-func readRecord(r io.Reader, buf []byte, recTyped bool, crcTable *crc32.Table, checkCRC bool) ([]byte, int, recordType, error) {
+func (fs *FileStore) readRecord(r io.Reader, buf []byte, recTyped bool, crcTable *crc32.Table, checkCRC bool) ([]byte, int, int, recordType, error) {
 	_header := [recordHeaderSize]byte{}
 	header := _header[:]
 	if _, err := io.ReadFull(r, header); err != nil {
-		return buf, 0, recNoType, err
+		return buf, 0, 0, recNoType, err
 	}
 	recType := recNoType
 	recSize := 0
@@ -702,15 +750,29 @@ func readRecord(r io.Reader, buf []byte, recTyped bool, crcTable *crc32.Table, c
 	// Now we are going to read the payload
 	buf = util.EnsureBufBigEnough(buf, recSize)
 	if _, err := io.ReadFull(r, buf[:recSize]); err != nil {
-		return buf, 0, recNoType, err
+		return buf, 0, 0, recNoType, err
 	}
 	if checkCRC {
 		// check CRC against what was stored
 		if c := crc32.Checksum(buf[:recSize], crcTable); c != crc {
-			return buf, 0, recNoType, fmt.Errorf("corrupted data, expected crc to be 0x%08x, got 0x%08x", crc, c)
+			return buf, 0, 0, recNoType, fmt.Errorf("corrupted data, expected crc to be 0x%08x, got 0x%08x", crc, c)
 		}
 	}
-	return buf, recSize, recType, nil
+	payloadSize := recSize
+	// If configured to use encryption, assume record is encrypted.
+	// This will fail if it wasn't, which is ok.
+	if fs.gcm != nil {
+		if recSize < fs.nonceSize {
+			return buf, 0, 0, recType, io.ErrUnexpectedEOF
+		}
+		ret, err := fs.gcm.Open(buf[:0], buf[:fs.nonceSize], buf[fs.nonceSize:recSize], nil)
+		if err != nil {
+			return buf, 0, 0, recType, err
+		}
+		// real payload size
+		payloadSize = len(ret)
+	}
+	return buf, recSize, payloadSize, recType, nil
 }
 
 // setSize sets the initial buffer size and keep track of min/max allowed sizes
@@ -1108,6 +1170,31 @@ func NewFileStore(log logger.Logger, rootDir string, limits *StoreLimits, option
 			return nil, err
 		}
 	}
+
+	if fs.opts.Encryption {
+		if fs.opts.EncryptionKey == "" {
+			fs.opts.EncryptionKey = os.Getenv(FileStoreEnvEncryptionKey)
+			if fs.opts.EncryptionKey == "" {
+				return nil, ErrNoEncryptionKey
+			}
+		}
+		h := sha256.New()
+		h.Write([]byte(fs.opts.EncryptionKey))
+		keyHash := h.Sum(nil)
+		gcm, err := chacha20poly1305.New(keyHash)
+		if err != nil {
+			return nil, err
+		}
+		nonce := make([]byte, gcm.NonceSize())
+		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+			return nil, err
+		}
+		fs.gcm = gcm
+		fs.nonce = nonce
+		fs.nonceSize = gcm.NonceSize()
+		fs.cryptoOverhead = fs.nonceSize + gcm.Overhead()
+	}
+
 	// Create filesManager based on options' FD limit
 	fs.fm = createFilesManager(rootDir, fs.opts.FileDescriptorsLimit)
 	// Convert the compact interval in time.Duration
@@ -1368,7 +1455,7 @@ func (fs *FileStore) Init(info *spb.ServerInfo) error {
 		return err
 	}
 	// ServerInfo record is not typed. We also don't pass a reusable buffer.
-	if _, _, err := writeRecord(f, nil, recNoType, info, info.Size(), fs.crcTable); err != nil {
+	if _, _, err := fs.writeRecord(f, nil, recNoType, info, info.Size()); err != nil {
 		return err
 	}
 	return nil
@@ -1376,9 +1463,12 @@ func (fs *FileStore) Init(info *spb.ServerInfo) error {
 
 // recoverClients reads the client files and returns an array of RecoveredClient
 func (fs *FileStore) recoverClients(file *os.File) ([]*Client, error) {
-	var err error
-	var recType recordType
-	var recSize int
+	var (
+		err         error
+		recType     recordType
+		payloadSize int
+		recSize     int // may be bigger than payloadSize if data is encrypted
+	)
 
 	_buf := [256]byte{}
 	buf := _buf[:]
@@ -1387,7 +1477,7 @@ func (fs *FileStore) recoverClients(file *os.File) ([]*Client, error) {
 	br := bufio.NewReaderSize(file, defaultBufSize)
 
 	for {
-		buf, recSize, recType, err = readRecord(br, buf, true, fs.crcTable, fs.opts.DoCRC)
+		buf, recSize, payloadSize, recType, err = fs.readRecord(br, buf, true, fs.crcTable, fs.opts.DoCRC)
 		if err != nil {
 			if err == io.EOF {
 				err = nil
@@ -1399,7 +1489,7 @@ func (fs *FileStore) recoverClients(file *os.File) ([]*Client, error) {
 		switch recType {
 		case addClient:
 			c := &Client{}
-			if err := c.ClientInfo.Unmarshal(buf[:recSize]); err != nil {
+			if err := c.ClientInfo.Unmarshal(buf[:payloadSize]); err != nil {
 				return nil, err
 			}
 			// Add to the map. Note that if one already exists, which should
@@ -1407,7 +1497,7 @@ func (fs *FileStore) recoverClients(file *os.File) ([]*Client, error) {
 			fs.clients[c.ID] = c
 		case delClient:
 			c := spb.ClientDelete{}
-			if err := c.Unmarshal(buf[:recSize]); err != nil {
+			if err := c.Unmarshal(buf[:payloadSize]); err != nil {
 				return nil, err
 			}
 			delete(fs.clients, c.ID)
@@ -1429,7 +1519,7 @@ func (fs *FileStore) recoverClients(file *os.File) ([]*Client, error) {
 // recoverServerInfo reads the server file and returns a ServerInfo structure
 func (fs *FileStore) recoverServerInfo(file *os.File) (*spb.ServerInfo, error) {
 	info := &spb.ServerInfo{}
-	buf, size, _, err := readRecord(file, nil, false, fs.crcTable, fs.opts.DoCRC)
+	buf, recSize, payloadSize, _, err := fs.readRecord(file, nil, false, fs.crcTable, fs.opts.DoCRC)
 	if err != nil {
 		if err == io.EOF {
 			// We are done, no state recovered
@@ -1445,13 +1535,13 @@ func (fs *FileStore) recoverServerInfo(file *os.File) (*spb.ServerInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	expectedSize := int64(size + 4 + recordHeaderSize)
+	expectedSize := int64(recSize + 4 + recordHeaderSize)
 	if fstat.Size() != expectedSize {
 		return nil, fmt.Errorf("incorrect file size, expected %v bytes, got %v bytes",
 			expectedSize, fstat.Size())
 	}
 	// Reconstruct now
-	if err := info.Unmarshal(buf[:size]); err != nil {
+	if err := info.Unmarshal(buf[:payloadSize]); err != nil {
 		return nil, err
 	}
 	return info, nil
@@ -1508,7 +1598,7 @@ func (fs *FileStore) AddClient(clientID, hbInbox string) (*Client, error) {
 		return nil, err
 	}
 	fs.addClientRec = spb.ClientInfo{ID: clientID, HbInbox: hbInbox}
-	_, size, err := writeRecord(fs.clientsFile.handle, nil, addClient, &fs.addClientRec, fs.addClientRec.Size(), fs.crcTable)
+	_, size, err := fs.writeRecord(fs.clientsFile.handle, nil, addClient, &fs.addClientRec, fs.addClientRec.Size())
 	if err != nil {
 		fs.fm.unlockFile(fs.clientsFile)
 		fs.Unlock()
@@ -1530,7 +1620,7 @@ func (fs *FileStore) DeleteClient(clientID string) error {
 		return err
 	}
 	fs.delClientRec = spb.ClientDelete{ID: clientID}
-	_, size, err := writeRecord(fs.clientsFile.handle, nil, delClient, &fs.delClientRec, fs.delClientRec.Size(), fs.crcTable)
+	_, size, err := fs.writeRecord(fs.clientsFile.handle, nil, delClient, &fs.delClientRec, fs.delClientRec.Size())
 	// Even if there is an error, proceed. If we compact the file,
 	// this may resolve the issue.
 	delete(fs.clients, clientID)
@@ -1604,7 +1694,7 @@ func (fs *FileStore) compactClientFile(orgFileName string) error {
 	// Dump the content of active clients into the temporary file.
 	for _, c := range fs.clients {
 		fs.addClientRec = spb.ClientInfo{ID: c.ID, HbInbox: c.HbInbox}
-		buf, size, err = writeRecord(bw, buf, addClient, &fs.addClientRec, fs.addClientRec.Size(), fs.crcTable)
+		buf, size, err = fs.writeRecord(bw, buf, addClient, &fs.addClientRec, fs.addClientRec.Size())
 		if err != nil {
 			return err
 		}
@@ -1641,6 +1731,14 @@ func getTempFile(rootDir, prefix string) (*os.File, error) {
 		return nil, err
 	}
 	return tmpFile, nil
+}
+
+// Used in tests
+func (fs *FileStore) recordOverhead() int {
+	fs.RLock()
+	defer fs.RUnlock()
+	overhead := recordHeaderSize + fs.cryptoOverhead
+	return overhead
 }
 
 // Close closes all stores.
@@ -1969,12 +2067,14 @@ func (ms *FileMsgStore) closeLockedFiles(fslice *fileSlice) error {
 
 // recovers one of the file
 func (ms *FileMsgStore) recoverOneMsgFile(fslice *fileSlice, fseq int, useIdxFile bool) (bool, error) {
-	var err error
-
-	msgSize := 0
-	var msg *pb.MsgProto
-	var mindex *msgIndex
-	var seq uint64
+	var (
+		err     error
+		msgSize int
+		msg     *pb.MsgProto
+		mindex  *msgIndex
+		seq     uint64
+		recSize int
+	)
 
 	// Select which file to recover based on presence of index file
 	file := fslice.file
@@ -2021,7 +2121,7 @@ func (ms *FileMsgStore) recoverOneMsgFile(fslice *fileSlice, fseq int, useIdxFil
 		bw := bufio.NewWriterSize(fslice.idxFile.handle, msgIndexRecSize*1000)
 
 		for {
-			ms.tmpMsgBuf, msgSize, _, err = readRecord(br, ms.tmpMsgBuf, false, crcTable, doCRC)
+			ms.tmpMsgBuf, recSize, msgSize, _, err = ms.fstore.readRecord(br, ms.tmpMsgBuf, false, crcTable, doCRC)
 			if err != nil {
 				if err == io.EOF {
 					// We are done, reset err
@@ -2044,7 +2144,7 @@ func (ms *FileMsgStore) recoverOneMsgFile(fslice *fileSlice, fseq int, useIdxFil
 			fslice.msgsCount++
 			// For size, add the message record size, the record header and the size
 			// required for the corresponding index record.
-			fslice.msgsSize += uint64(msgSize + msgRecordOverhead)
+			fslice.msgsSize += uint64(recSize + msgRecordOverhead)
 			if fslice.firstWrite == 0 {
 				fslice.firstWrite = msg.Timestamp
 			}
@@ -2055,7 +2155,7 @@ func (ms *FileMsgStore) recoverOneMsgFile(fslice *fileSlice, fseq int, useIdxFil
 				break
 			}
 			// Move offset
-			offset += int64(recordHeaderSize + msgSize)
+			offset += int64(recSize + recordHeaderSize)
 		}
 		if err == nil {
 			err = bw.Flush()
@@ -2288,7 +2388,7 @@ func (ms *FileMsgStore) Store(data []byte) (uint64, error) {
 	}
 	msgSize := m.Size()
 	if bwBuf != nil {
-		required := msgSize + recordHeaderSize
+		required := msgSize + recordHeaderSize + ms.fstore.cryptoOverhead
 		if required > bwBuf.Available() {
 			ms.writer, err = ms.bw.expand(fslice.file.handle, required)
 			if err != nil {
@@ -2304,7 +2404,7 @@ func (ms *FileMsgStore) Store(data []byte) (uint64, error) {
 			bwBuf = ms.bw.buf
 		}
 	}
-	ms.tmpMsgBuf, recSize, err = writeRecord(ms.writer, ms.tmpMsgBuf, recNoType, m, msgSize, ms.fstore.crcTable)
+	ms.tmpMsgBuf, recSize, err = ms.fstore.writeRecord(ms.writer, ms.tmpMsgBuf, recNoType, m, msgSize)
 	if err != nil {
 		goto processErr
 	}
@@ -2773,7 +2873,7 @@ func (ms *FileMsgStore) lookup(seq uint64) (*pb.MsgProto, error) {
 			// Position file to message's offset. 0 means from start.
 			_, err = file.Seek(msgIndex.offset, 0)
 			if err == nil {
-				ms.tmpMsgBuf, _, _, err = readRecord(file, ms.tmpMsgBuf, false, ms.fstore.crcTable, ms.fstore.opts.DoCRC)
+				ms.tmpMsgBuf, _, _, _, err = ms.fstore.readRecord(file, ms.tmpMsgBuf, false, ms.fstore.crcTable, ms.fstore.opts.DoCRC)
 			}
 		}
 		ms.unlockFiles(fslice)
@@ -3063,6 +3163,7 @@ func (ms *FileMsgStore) Flush() error {
 // newFileSubStore returns a new instace of a file SubStore.
 func (fs *FileStore) newFileSubStore(channel string, limits *SubStoreLimits, doRecover bool) (*FileSubStore, error) {
 	ss := &FileSubStore{
+		fstore:   fs,
 		fm:       fs.fm,
 		opts:     &fs.opts,
 		crcTable: fs.crcTable,
@@ -3168,15 +3269,17 @@ func (ss *FileSubStore) shrinkBuffer(fromTimer bool) {
 
 // recoverSubscriptions recovers subscriptions state for this store.
 func (ss *FileSubStore) recoverSubscriptions(file *os.File) error {
-	var err error
-	var recType recordType
-
-	recSize := 0
+	var (
+		err         error
+		recType     recordType
+		payloadSize int
+		recSize     int // may be bigger than payloadSize if data is encrypted
+	)
 	// Create a buffered reader to speed-up recovery
 	br := bufio.NewReaderSize(file, defaultBufSize)
 
 	for {
-		ss.tmpSubBuf, recSize, recType, err = readRecord(br, ss.tmpSubBuf, true, ss.crcTable, ss.opts.DoCRC)
+		ss.tmpSubBuf, recSize, payloadSize, recType, err = ss.fstore.readRecord(br, ss.tmpSubBuf, true, ss.crcTable, ss.opts.DoCRC)
 		if err != nil {
 			if err == io.EOF {
 				// We are done, reset err
@@ -3191,7 +3294,7 @@ func (ss *FileSubStore) recoverSubscriptions(file *os.File) error {
 		switch recType {
 		case subRecNew:
 			newSub := &spb.SubState{}
-			if err := newSub.Unmarshal(ss.tmpSubBuf[:recSize]); err != nil {
+			if err := newSub.Unmarshal(ss.tmpSubBuf[:payloadSize]); err != nil {
 				return err
 			}
 			sub := &subscription{
@@ -3206,7 +3309,7 @@ func (ss *FileSubStore) recoverSubscriptions(file *os.File) error {
 			ss.numRecs++
 		case subRecUpdate:
 			modifiedSub := &spb.SubState{}
-			if err := modifiedSub.Unmarshal(ss.tmpSubBuf[:recSize]); err != nil {
+			if err := modifiedSub.Unmarshal(ss.tmpSubBuf[:payloadSize]); err != nil {
 				return err
 			}
 			// Search if the create has been recovered.
@@ -3230,7 +3333,7 @@ func (ss *FileSubStore) recoverSubscriptions(file *os.File) error {
 			ss.numRecs++
 		case subRecDel:
 			delSub := spb.SubStateDelete{}
-			if err := delSub.Unmarshal(ss.tmpSubBuf[:recSize]); err != nil {
+			if err := delSub.Unmarshal(ss.tmpSubBuf[:payloadSize]); err != nil {
 				return err
 			}
 			if si, exists := ss.subs[delSub.ID]; exists {
@@ -3246,7 +3349,7 @@ func (ss *FileSubStore) recoverSubscriptions(file *os.File) error {
 			}
 		case subRecMsg:
 			updateSub := spb.SubStateUpdate{}
-			if err := updateSub.Unmarshal(ss.tmpSubBuf[:recSize]); err != nil {
+			if err := updateSub.Unmarshal(ss.tmpSubBuf[:payloadSize]); err != nil {
 				return err
 			}
 			if subi, exists := ss.subs[updateSub.ID]; exists {
@@ -3262,7 +3365,7 @@ func (ss *FileSubStore) recoverSubscriptions(file *os.File) error {
 			}
 		case subRecAck:
 			updateSub := spb.SubStateUpdate{}
-			if err := updateSub.Unmarshal(ss.tmpSubBuf[:recSize]); err != nil {
+			if err := updateSub.Unmarshal(ss.tmpSubBuf[:payloadSize]); err != nil {
 				return err
 			}
 			if subi, exists := ss.subs[updateSub.ID]; exists {
@@ -3506,7 +3609,7 @@ func (ss *FileSubStore) writeRecord(w io.Writer, recType recordType, rec record)
 			// not already at the max size...
 			if bwBuf != nil && ss.bw.bufSize != ss.opts.BufferSize {
 				// Check if record fits
-				required := recSize + recordHeaderSize
+				required := recSize + recordHeaderSize + ss.fstore.cryptoOverhead
 				if required > bwBuf.Available() {
 					ss.writer, err = ss.bw.expand(ss.file.handle, required)
 					if err != nil {
@@ -3519,7 +3622,7 @@ func (ss *FileSubStore) writeRecord(w io.Writer, recType recordType, rec record)
 		}
 		w = ss.writer
 	}
-	ss.tmpSubBuf, totalSize, err = writeRecord(w, ss.tmpSubBuf, recType, rec, recSize, ss.crcTable)
+	ss.tmpSubBuf, totalSize, err = ss.fstore.writeRecord(w, ss.tmpSubBuf, recType, rec, recSize)
 	if err != nil {
 		if needsUnlock {
 			ss.fm.unlockFile(ss.file)

@@ -44,6 +44,8 @@ var (
 	errOnPurpose        = errors.New("On purpose")
 	benchStoreType      = stores.TypeMemory
 	persistentStoreType = stores.TypeFile
+	testUseEncryption   bool
+	testEncryptionKey   = "testkey"
 )
 
 // The SourceAdmin is used by the test setup to have access
@@ -75,6 +77,8 @@ func TestMain(m *testing.M) {
 	)
 	flag.StringVar(&bst, "bench_store", "", "store type for bench tests (mem, file)")
 	flag.StringVar(&pst, "persistent_store", "", "store type for server recovery related tests (file)")
+	flag.BoolVar(&testUseEncryption, "encryption", testUseEncryption, "use encryption")
+	flag.StringVar(&testEncryptionKey, "encryption_key", testEncryptionKey, "encryption key")
 	test.AddSQLFlags(flag.CommandLine, &testSQLDriver, &testSQLSource, &testSQLSourceAdmin, &testSQLDatabaseName)
 	flag.Parse()
 	bst = strings.ToUpper(bst)
@@ -356,6 +360,10 @@ func getTestDefaultOptsForPersistentStore() *Options {
 	case stores.TypeFile:
 		opts.FilestoreDir = defaultDataStore
 		opts.FileStoreOpts.BufferSize = 1024
+		if testUseEncryption {
+			opts.FileStoreOpts.Encryption = true
+			opts.FileStoreOpts.EncryptionKey = testEncryptionKey
+		}
 	case stores.TypeSQL:
 		opts.SQLStoreOpts.Driver = testSQLDriver
 		opts.SQLStoreOpts.Source = testSQLSource

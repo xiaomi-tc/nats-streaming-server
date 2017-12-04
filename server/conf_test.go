@@ -106,6 +106,12 @@ func TestParseConfig(t *testing.T) {
 	if opts.FileStoreOpts.ParallelRecovery != 9 {
 		t.Fatalf("Expected ParallelRecovery to be 9, got %v", opts.FileStoreOpts.ParallelRecovery)
 	}
+	if !opts.FileStoreOpts.Encryption {
+		t.Fatal("Expected Encryption to be true, was false")
+	}
+	if opts.FileStoreOpts.EncryptionKey != "key" {
+		t.Fatalf("Expected EncryptionKey to be %q, was %q", "key", opts.FileStoreOpts.EncryptionKey)
+	}
 	if opts.MaxChannels != 11 {
 		t.Fatalf("Expected MaxChannels to be 11, got %v", opts.MaxChannels)
 	}
@@ -361,6 +367,8 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "file:{slice_archive_script:123}", wrongTypeErr)
 	expectFailureFor(t, "file:{fds_limit:false}", wrongTypeErr)
 	expectFailureFor(t, "file:{parallel_recovery:false}", wrongTypeErr)
+	expectFailureFor(t, "file:{encryption:123}", wrongTypeErr)
+	expectFailureFor(t, "file:{encryption_key:123}", wrongTypeErr)
 	expectFailureFor(t, "sql:{driver:false}", wrongTypeErr)
 	expectFailureFor(t, "sql:{source:false}", wrongTypeErr)
 	expectFailureFor(t, "sql:{no_caching:123}", wrongTypeErr)
