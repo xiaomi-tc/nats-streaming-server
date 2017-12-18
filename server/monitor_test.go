@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"reflect"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,11 +24,12 @@ import (
 )
 
 const (
-	monitorHost  = "127.0.0.1"
-	monitorPort  = 8222
-	expectedJSON = "application/json"
-	expectedText = "text/html; charset=utf-8"
-	expectedCb   = "application/javascript"
+	monitorHost       = "127.0.0.1"
+	monitorPort       = 8222
+	expectedJSON      = "application/json"
+	expectedText      = "text/html; charset=utf-8"
+	expectedPlainText = "text/plain; charset=utf-8"
+	expectedCb        = "application/javascript"
 )
 
 var defaultMonitorOptions = natsd.Options{
@@ -52,11 +54,15 @@ func runMonitorServer(t *testing.T, sOpts *Options) *StanServer {
 	return runServerWithOpts(t, sOpts, &nOpts)
 }
 
-func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, expectedStatus int, expectedContentType string) (*http.Response, []byte) {
+func getBodyEx(t *testing.T, client *http.Client, method, scheme, endpoint string, expectedStatus int, expectedContentType string) (*http.Response, []byte) {
 	url := fmt.Sprintf("%s://%s:%d%s", scheme, monitorHost, monitorPort, endpoint)
-	resp, err := client.Get(url)
+	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
-		stackFatalf(t, "Expected no error: Got %v\n", err)
+		stackFatalf(t, "Error on NewRequest: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		stackFatalf(t, "Error on client.Do: %v\n", err)
 	}
 	if resp.StatusCode != expectedStatus {
 		stackFatalf(t, "Expected a %d response, got %d\n", expectedStatus, resp.StatusCode)
@@ -74,14 +80,18 @@ func getBodyEx(t *testing.T, client *http.Client, scheme, endpoint string, expec
 }
 
 func getBody(t *testing.T, endpoint, expectedContentType string) (*http.Response, []byte) {
-	return getBodyEx(t, http.DefaultClient, "http", endpoint, http.StatusOK, expectedContentType)
+	return getBodyEx(t, http.DefaultClient, "GET", "http", endpoint, http.StatusOK, expectedContentType)
 }
 
-func monitorExpectStatusEx(t *testing.T, client *http.Client, scheme, endpoint string, expectedStatus int) {
+func monitorExpectStatusEx(t *testing.T, client *http.Client, method, scheme, endpoint string, expectedStatus int) {
 	url := fmt.Sprintf("%s://%s:%d%s", scheme, monitorHost, monitorPort, endpoint)
-	resp, err := client.Get(url)
+	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
-		stackFatalf(t, "Expected no error: Got %v\n", err)
+		stackFatalf(t, "Error on new request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		stackFatalf(t, "Error on client.Do: %v\n", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != expectedStatus {
@@ -90,7 +100,7 @@ func monitorExpectStatusEx(t *testing.T, client *http.Client, scheme, endpoint s
 }
 
 func monitorExpectStatus(t *testing.T, endpoint string, expectedStatus int) {
-	monitorExpectStatusEx(t, http.DefaultClient, "http", endpoint, expectedStatus)
+	monitorExpectStatusEx(t, http.DefaultClient, "GET", "http", endpoint, expectedStatus)
 }
 
 func TestMonitorUseEmbeddedNATSServer(t *testing.T) {
@@ -149,7 +159,7 @@ func TestMonitorStartOwnHTTPSServer(t *testing.T) {
 	transport := &http.Transport{TLSClientConfig: tlsConfig}
 	httpClient := &http.Client{Transport: transport}
 
-	r, _ := getBodyEx(t, httpClient, "https", RootPath, http.StatusOK, expectedText)
+	r, _ := getBodyEx(t, httpClient, "GET", "https", RootPath, http.StatusOK, expectedText)
 	r.Body.Close()
 }
 
@@ -924,32 +934,37 @@ func TestMonitorChannelsWithSubsz(t *testing.T) {
 		generateExpectedCZ(1, 2, 2, channels[1:1+2]),
 	}
 
-	for i := 0; i < len(paths); i++ {
-		resp, body := getBody(t, ChannelsPath+paths[i], expectedJSON)
-		defer resp.Body.Close()
-
-		cz := Channelsz{}
-		if err := json.Unmarshal(body, &cz); err != nil {
-			t.Fatalf("Got an error unmarshalling the body: %v", err)
-		}
-		resp.Body.Close()
-		goal := *expected[i]
-		// We cannot assume Now, so remove it for comparison
-		cz.Now = time.Time{}
-		for i, channelz := range goal.Channels {
-			if channelz.Subscriptions != nil {
-				if err := compareChannelSubs(channelz.Name, channelz.Subscriptions, cz.Channels[i].Subscriptions); err != nil {
-					t.Fatalf("Iter=%v - Path=%q - %v", i, ClientsPath+paths[i], err)
-				}
-				// Now nilify the Subscriptions for the DeepEqual call
-				channelz.Subscriptions = nil
-				cz.Channels[i].Subscriptions = nil
-			} else if cz.Channels[i].Subscriptions != nil {
-				t.Fatalf("Iter=%v - Path=%q - Was not expecting subscriptions, got %v", i, ClientsPath+paths[i], cz.Channels[i].Subscriptions)
+	for m := 0; m < 2; m++ {
+		for i := 0; i < len(paths); i++ {
+			var url string
+			if m == 0 {
+				url = ChannelsPath + paths[i]
+			} else {
+				url = RESTChannelsPath + paths[i]
 			}
-		}
-		if !reflect.DeepEqual(cz, goal) {
-			t.Fatalf("Iter=%v - Path=%q - Expected to get %v, got %v", i, ChannelsPath+paths[i], goal, cz)
+			resp, body := getBody(t, url, expectedJSON)
+			defer resp.Body.Close()
+
+			cz := Channelsz{}
+			if err := json.Unmarshal(body, &cz); err != nil {
+				t.Fatalf("Got an error unmarshalling the body: %v", err)
+			}
+			resp.Body.Close()
+			goal := *expected[i]
+			// We cannot assume Now, so remove it for comparison
+			cz.Now = time.Time{}
+			for i, channelz := range goal.Channels {
+				if channelz.Subscriptions != nil {
+					if err := compareChannelSubs(channelz.Name, channelz.Subscriptions, cz.Channels[i].Subscriptions); err != nil {
+						t.Fatalf("Rest=%v - Path=%q - %v", (m == 1), url, err)
+					}
+				} else if cz.Channels[i].Subscriptions != nil {
+					t.Fatalf("Rest=%v - Path=%q - Was not expecting subscriptions, got %v", (m == 1), url, cz.Channels[i].Subscriptions)
+				}
+			}
+			if !reflect.DeepEqual(cz, goal) {
+				t.Fatalf("Rest=%v - Path=%q - Expected to get %v, got %v", (m == 1), url, goal, cz)
+			}
 		}
 	}
 }
@@ -1010,8 +1025,11 @@ func TestMonitorChannelz(t *testing.T) {
 		return channelz
 	}
 
-	paths := []string{"?channel=bar", "?channel=foo", "?channel=foo.bar&subs=1"}
+	paths := []string{"?channel=bar", "?channel=foo", "?channel=foo.bar&subs=1", "/bar", "/foo", "/foo.bar/subs"}
 	expected := []*Channelz{
+		generateExpectedCZ("bar", false),
+		generateExpectedCZ("foo", false),
+		generateExpectedCZ("foo.bar", true),
 		generateExpectedCZ("bar", false),
 		generateExpectedCZ("foo", false),
 		generateExpectedCZ("foo.bar", true),
@@ -1118,5 +1136,227 @@ func TestMonitorDurableSubs(t *testing.T) {
 			// There shouldn't be any sub now
 			getAndCheck(false, 0)
 		}
+	}
+}
+
+func TestMonitorDeleteChannelNoAdminEnabled(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	nOpts := natsdTest.DefaultTestOptions
+	nOpts.HTTPHost = monitorHost
+	nOpts.HTTPPort = monitorPort
+	s := runServerWithOpts(t, nil, &nOpts)
+	defer s.Shutdown()
+
+	channelsLookupOrCreate(t, s, "foo")
+
+	monitorExpectStatusEx(t, http.DefaultClient, "DELETE", "http", RESTChannelsPath+"foo", http.StatusForbidden)
+}
+
+type deleteChannelMockStore struct {
+	sync.Mutex
+	stores.Store
+	beSlow bool
+	doFail bool
+}
+
+func (s *deleteChannelMockStore) DeleteChannel(name string) error {
+	s.Lock()
+	defer s.Unlock()
+	if s.beSlow {
+		time.Sleep(300 * time.Millisecond)
+	} else if s.doFail {
+		return errOnPurpose
+	}
+	return s.Store.DeleteChannel(name)
+}
+
+func TestMonitorDeleteChannel(t *testing.T) {
+	type deleteChannelMode struct {
+		scheme     string
+		persistent bool
+	}
+	runs := []*deleteChannelMode{
+		&deleteChannelMode{"http", false},
+		&deleteChannelMode{"http", true},
+		&deleteChannelMode{"https", false},
+		&deleteChannelMode{"https", true},
+	}
+	for _, r := range runs {
+		r := r
+		name := r.scheme
+		if r.persistent {
+			name += "_persistent_store"
+		}
+		t.Run(name, func(t *testing.T) {
+			nOpts := natsdTest.DefaultTestOptions
+			nOpts.HTTPHost = monitorHost
+			if r.scheme == "https" {
+				nOpts.HTTPSPort = monitorPort
+				nOpts.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+				cert, err := tls.LoadX509KeyPair("../test/certs/server-cert.pem", "../test/certs/server-key.pem")
+				if err != nil {
+					t.Fatalf("Got error reading certificates: %s", err)
+				}
+				nOpts.TLSConfig.Certificates = []tls.Certificate{cert}
+			} else {
+				nOpts.HTTPPort = monitorPort
+			}
+
+			resetPreviousHTTPConnections()
+
+			var sOpts *Options
+			if !r.persistent {
+				sOpts = GetDefaultOptions()
+			} else {
+				cleanupDatastore(t)
+				defer cleanupDatastore(t)
+				sOpts = getTestDefaultOptsForPersistentStore()
+			}
+			if r.scheme == "https" {
+				sOpts.Secure = true
+			}
+			// Make sure we can delete channels
+			sOpts.EnableAdminControl = true
+
+			sOpts.Partitioning = true
+			sOpts.AddPerChannel("partitioned", &stores.ChannelLimits{})
+			setPartitionsVarsForTest()
+			defer resetDefaultPartitionsVars()
+			s := runServerWithOpts(t, sOpts, &nOpts)
+			defer s.Shutdown()
+
+			var httpClient *http.Client
+			if r.scheme == "https" {
+				tlsConfig := &tls.Config{}
+				caCert, err := ioutil.ReadFile("../test/certs/ca.pem")
+				if err != nil {
+					t.Fatalf("Got error reading RootCA file: %s", err)
+				}
+				caCertPool := x509.NewCertPool()
+				caCertPool.AppendCertsFromPEM(caCert)
+				tlsConfig.RootCAs = caCertPool
+				transport := &http.Transport{TLSClientConfig: tlsConfig}
+				httpClient = &http.Client{Transport: transport}
+			} else {
+				httpClient = http.DefaultClient
+			}
+
+			// Not allowed with Partitioning
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"partitioned", http.StatusForbidden)
+			s.Shutdown()
+
+			// Restart server without partitioning for the rest of the tests
+			sOpts.Partitioning = false
+			sOpts.PerChannel = nil
+			s = runServerWithOpts(t, sOpts, &nOpts)
+			defer s.Shutdown()
+
+			// Channel not found
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"foo", http.StatusNotFound)
+
+			var (
+				sc stan.Conn
+				nc *nats.Conn
+			)
+			if r.scheme == "https" {
+				sc, nc = createConnectionWithNatsOpts(t, clientName, nats.Secure(nil))
+			} else {
+				sc, nc = createConnectionWithNatsOpts(t, clientName)
+			}
+			defer nc.Close()
+			defer sc.Close()
+
+			if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+			waitForNumSubs(t, s, clientName, 1)
+
+			// Has subs, so forbidden
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"foo", http.StatusForbidden)
+
+			// Try with various type of subscriptions
+			if _, err := sc.Subscribe("bar", func(_ *stan.Msg) {}, stan.DurableName("dur")); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+			waitForNumSubs(t, s, clientName, 2)
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"bar", http.StatusForbidden)
+
+			if _, err := sc.QueueSubscribe("baz", "queue", func(_ *stan.Msg) {}); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+			waitForNumSubs(t, s, clientName, 3)
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"baz", http.StatusForbidden)
+
+			if _, err := sc.QueueSubscribe("bozo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur")); err != nil {
+				t.Fatalf("Unexpected error on subscribe: %v", err)
+			}
+			waitForNumSubs(t, s, clientName, 4)
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"bozo", http.StatusForbidden)
+
+			// Create channel without subs
+			channelsLookupOrCreate(t, s, "deleteok")
+			// Delete and expect no error
+			getBodyEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"deleteok", http.StatusOK, expectedPlainText)
+			// Make sure it has been removed
+			if c := s.channels.get("deleteok"); c != nil {
+				t.Fatalf("Channel should have been deleted, got %v", c)
+			}
+			sc.Close()
+			nc.Close()
+
+			// Force timeout
+			channelsLookupOrCreate(t, s, "deletetimeout")
+			deleteChannelTimeout = 250 * time.Millisecond
+			defer func() { deleteChannelTimeout = defaultDeleteChannelTimeout }()
+			s.channels.Lock()
+			ms := &deleteChannelMockStore{Store: s.channels.store}
+			s.channels.store = ms
+			s.channels.Unlock()
+			ms.Lock()
+			ms.beSlow = true
+			ms.Unlock()
+			// Delete and expect timeout error
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"deletetimeout", http.StatusRequestTimeout)
+			// The channel should still have been removed.
+			// Need to wait for store to finish
+			var c *channel
+			for i := 0; i < 20; i++ {
+				c = s.channels.get("deletetimeout")
+				if c == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if c != nil {
+				t.Fatal("Channel should have been removed")
+			}
+
+			// Force store error
+			ms.Lock()
+			ms.beSlow = false
+			ms.doFail = true
+			ms.Unlock()
+			channelsLookupOrCreate(t, s, "storeerror")
+			// Delete and expect internal server error
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"storeerror", http.StatusInternalServerError)
+
+			// Force NATS errors
+			channelsLookupOrCreate(t, s, "natserror")
+			s.nc.Close()
+			// Delete and expect internal server error
+			monitorExpectStatusEx(t, httpClient, "DELETE", r.scheme, RESTChannelsPath+"natserror", http.StatusInternalServerError)
+
+			if r.persistent {
+				// Persistence mode, try to restart the server and ensure channel is not recovered
+				s.Shutdown()
+				resetPreviousHTTPConnections()
+				s = runServerWithOpts(t, sOpts, &nOpts)
+				if c := s.channels.get("deleteok"); c != nil {
+					t.Fatalf("Channel should not exist after a server restart, got %v", c)
+				}
+				defer s.Shutdown()
+			}
+		})
 	}
 }

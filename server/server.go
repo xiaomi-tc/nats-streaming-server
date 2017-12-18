@@ -103,6 +103,10 @@ const (
 	// mode we will possibly wait to be notified when the client has been
 	// registered. This is the default duration for this wait.
 	defaultClientCheckTimeout = 2 * time.Second
+
+	// Maximum time the call deleteChannel blocks waiting for the operation
+	// to complete.
+	defaultDeleteChannelTimeout = 2 * time.Second
 )
 
 // Constant to indicate that sendMsgToSub() should check number of acks pending
@@ -112,7 +116,7 @@ const (
 	honorMaxInFlight = false
 )
 
-// Errors.
+// Errors sent to clients
 var (
 	ErrInvalidSubject     = errors.New("stan: invalid subject")
 	ErrInvalidStart       = errors.New("stan: invalid start position")
@@ -130,7 +134,16 @@ var (
 	ErrDupDurable         = errors.New("stan: duplicate durable registration")
 	ErrInvalidDurName     = errors.New("stan: durable name of a durable queue subscriber can't contain the character ':'")
 	ErrUnknownClient      = errors.New("stan: unknown clientID")
-	ErrNoChannel          = errors.New("stan: no configured channel")
+)
+
+// Internal errors
+var (
+	ErrNoChannel                      = errors.New("no configured channel")
+	ErrChannelNotFound                = errors.New("channel not found")
+	ErrChannelIsBeingDeleted          = errors.New("channel is being deleted")
+	ErrChannelHasSubscriptions        = errors.New("channel has subscriptions attached")
+	ErrOperationTimeout               = errors.New("operation timeout")
+	ErrNotPermittedInPartitioningMode = errors.New("operation not permitted when running in partitioning mode")
 )
 
 // Shared regular expression to check clientID validity.
@@ -141,6 +154,7 @@ var clientIDRegEx *regexp.Regexp
 var (
 	testAckWaitIsInMillisecond bool
 	clientCheckTimeout         = defaultClientCheckTimeout
+	deleteChannelTimeout       = defaultDeleteChannelTimeout
 )
 
 func computeAckWait(wait int32) time.Duration {
@@ -165,9 +179,10 @@ func init() {
 // number of memory allocations to 1 when processing a message from
 // producer.
 type ioPendingMsg struct {
-	m  *nats.Msg
-	pm pb.PubMsg
-	pa pb.PubAck
+	m   *nats.Msg
+	pm  pb.PubMsg
+	pa  pb.PubAck
+	ctd string // channel to delete
 }
 
 // Constant that defines the size of the channel that feeds the IO thread.
@@ -218,13 +233,16 @@ func (state State) String() string {
 
 type channelStore struct {
 	sync.RWMutex
+	delMu    sync.Mutex
 	channels map[string]*channel
 	store    stores.Store
+	deletes  map[string]*chan error
 }
 
 func newChannelStore(s stores.Store) *channelStore {
 	cs := &channelStore{
 		channels: make(map[string]*channel),
+		deletes:  make(map[string]*chan error),
 		store:    s,
 	}
 	return cs
@@ -303,6 +321,40 @@ func (cs *channelStore) count() int {
 	count := len(cs.channels)
 	cs.RUnlock()
 	return count
+}
+
+func (cs *channelStore) delete(name string) bool {
+	cs.delMu.Lock()
+	defer cs.delMu.Unlock()
+	cs.Lock()
+	defer cs.Unlock()
+	// Get the error go channel and remove from the map
+	errCh := cs.deletes[name]
+	delete(cs.deletes, name)
+	// Check if channel has subscriptions
+	c := cs.channels[name]
+	if c.ss.hasSubs() {
+		*errCh <- ErrChannelHasSubscriptions
+		return false
+	}
+	// Delete from store
+	err := cs.store.DeleteChannel(name)
+	// Give error back to caller
+	*errCh <- err
+	if err != nil {
+		return false
+	}
+	// If no error, remove channel
+	delete(cs.channels, name)
+	return true
+}
+
+func (cs *channelStore) blockDelete() {
+	cs.delMu.Lock()
+}
+
+func (cs *channelStore) unblockDelete() {
+	cs.delMu.Unlock()
 }
 
 type channel struct {
@@ -570,6 +622,14 @@ func (ss *subStore) updateState(sub *subState) {
 			ss.durables[sub.durableKey()] = sub
 		}
 	}
+}
+
+// hasSubs returns true if there is any sub (online and/or offline)
+// for this subStore.
+func (ss *subStore) hasSubs() bool {
+	ss.RLock()
+	defer ss.RUnlock()
+	return len(ss.psubs) > 0 || len(ss.qsubs) > 0 || len(ss.durables) > 0
 }
 
 // Remove a subscriber from the subscription store, leaving durable
@@ -845,6 +905,7 @@ type Options struct {
 	AckSubsPoolSize    int           // Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription).
 	FTGroupName        string        // Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
 	Partitioning       bool          // Specify if server only accepts messages/subscriptions on channels defined in StoreLimits.
+	EnableAdminControl bool          // Set to true if you want to be able to administer the server through monitor endpoints (such as deletign channels).
 }
 
 // Clone returns a deep copy of the Options object.
@@ -2203,6 +2264,46 @@ func (s *StanServer) processClientPublish(m *nats.Msg) {
 	s.ioChannel <- iopm
 }
 
+// deleteChannel will schedule a special ioPendingMsg to the ioLoop to
+// ensure that the actual removal of the channel is made after all
+// pending messages in IO channel are processed.
+// This function blocks (up to deleteChannelTimeout) until the channel
+// is completely removed or an error occurs during the processing of
+// the request.
+func (s *StanServer) deleteChannel(name string) error {
+	if s.partitions != nil {
+		return ErrNotPermittedInPartitioningMode
+	}
+	cs := s.channels
+	cs.Lock()
+	if cs.channels[name] == nil {
+		cs.Unlock()
+		return ErrChannelNotFound
+	}
+	// Already in the process of being deleted
+	if cs.deletes[name] != nil {
+		cs.Unlock()
+		return ErrChannelIsBeingDeleted
+	}
+	// Need to be buffered since we may give up waiting below although
+	// the processing may be continuing and later a send to this buffer
+	// will be done.
+	errCh := make(chan error, 1)
+	cs.deletes[name] = &errCh
+	s.ioChannel <- &ioPendingMsg{ctd: name}
+	cs.Unlock()
+
+	// Now wait for the operation to complete or we get a timeout.
+	// On timeout, do not cleanup and let the delete channel processing
+	// continue on its own.
+	select {
+	case e := <-errCh:
+		return e
+	case <-time.After(deleteChannelTimeout):
+		return ErrOperationTimeout
+	}
+}
+
 // processCtrlMsg processes the incoming message has a CtrlMsg.
 // If this is not a CtrlMsg, returns false to indicate an error.
 // If the CtrlMsg's ServerID is not this server, the request is simply
@@ -2709,6 +2810,16 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 	var pendingMsgs = _pendingMsgs[:0]
 
 	storeIOPendingMsg := func(iopm *ioPendingMsg) {
+		// Is this a request to delete a channel?
+		if iopm.ctd != "" {
+			c := s.channels.get(iopm.ctd)
+			if c != nil && s.channels.delete(iopm.ctd) {
+				// If channel was successfully deleted, we remove the channel
+				// from the stores that need to be flushed.
+				delete(storesToFlush, c)
+			}
+			return
+		}
 		cs, err := s.assignAndStore(&iopm.pm)
 		if err != nil {
 			s.log.Errorf("[Client:%s] Error processing message for subject %q: %v", iopm.pm.ClientID, iopm.m.Subject, err)
@@ -3178,6 +3289,11 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 			return
 		}
 	}
+
+	// Keep the channel delete mutex to ensure that channel cannot be
+	// deleted while we are about to add a subscription.
+	s.channels.blockDelete()
+	defer s.channels.unblockDelete()
 
 	// Grab channel state, create a new one if needed.
 	c, err := s.lookupOrCreateChannel(sr.Subject)

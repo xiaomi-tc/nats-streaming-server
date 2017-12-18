@@ -1028,3 +1028,34 @@ func TestCSLimitWithWildcardsInConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestCSDeleteChannel(t *testing.T) {
+	for _, st := range testStores {
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			t.Parallel()
+			defer endTest(t, st)
+			s := startTest(t, st)
+			defer s.Close()
+
+			if err := s.DeleteChannel("notfound"); err != ErrNotFound {
+				t.Fatalf("Expected %v error, got %v", ErrNotFound, err)
+			}
+			storeCreateChannel(t, s, "foo")
+			if err := s.DeleteChannel("foo"); err != nil {
+				t.Fatalf("Error on delete: %v", err)
+			}
+
+			if !st.recoverable {
+				return
+			}
+			// Restart the store and ensure channel "foo" is not reconvered
+			s.Close()
+			s, state := testReOpenStore(t, st, nil)
+			defer s.Close()
+			if state != nil && len(state.Channels) > 0 {
+				t.Fatal("Channel recovered after restart")
+			}
+		})
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	gnatsd "github.com/nats-io/gnatsd/server"
@@ -18,11 +19,12 @@ import (
 
 // Routes for the monitoring pages
 const (
-	RootPath     = "/streaming"
-	ServerPath   = RootPath + "/serverz"
-	StorePath    = RootPath + "/storez"
-	ClientsPath  = RootPath + "/clientsz"
-	ChannelsPath = RootPath + "/channelsz"
+	RootPath         = "/streaming"
+	ServerPath       = RootPath + "/serverz"
+	StorePath        = RootPath + "/storez"
+	ClientsPath      = RootPath + "/clientsz"
+	ChannelsPath     = RootPath + "/channelsz"
+	RESTChannelsPath = RootPath + "/channelsz/"
 
 	defaultMonitorListLimit = 1024
 )
@@ -136,6 +138,7 @@ func (s *StanServer) startMonitoring(nOpts *gnatsd.Options) error {
 	mux.HandleFunc(StorePath, s.handleStorez)
 	mux.HandleFunc(ClientsPath, s.handleClientsz)
 	mux.HandleFunc(ChannelsPath, s.handleChannelsz)
+	mux.HandleFunc(RESTChannelsPath, s.handleRESTChannelsz)
 
 	return nil
 }
@@ -392,51 +395,56 @@ func (a byChannelName) Less(i, j int) bool { return a[i].Name < a[j].Name }
 
 func (s *StanServer) handleChannelsz(w http.ResponseWriter, r *http.Request) {
 	channelName := r.URL.Query().Get("channel")
-	subsOption, _ := strconv.Atoi(r.URL.Query().Get("subs"))
 	if channelName != "" {
+		subsOption, _ := strconv.Atoi(r.URL.Query().Get("subs"))
 		s.handleOneChannel(w, r, channelName, subsOption)
 	} else {
-		offset, limit := getOffsetAndLimit(r)
-		channels := s.channels.getAll()
-		totalChannels := len(channels)
-		minoff, maxoff := getMinMaxOffset(offset, limit, totalChannels)
-		channelsz := &Channelsz{
-			ClusterID: s.info.ClusterID,
-			ServerID:  s.serverID,
-			Now:       time.Now(),
-			Offset:    offset,
-			Limit:     limit,
-			Total:     totalChannels,
-		}
-		if subsOption == 1 {
-			carr := make([]*Channelz, 0, totalChannels)
-			for cn := range channels {
-				cz := &Channelz{Name: cn}
-				carr = append(carr, cz)
-			}
-			sort.Sort(byChannelName(carr))
-			carr = carr[minoff:maxoff]
-			for _, cz := range carr {
-				cs := channels[cz.Name]
-				if err := updateChannelz(cz, cs, subsOption); err != nil {
-					http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", channelName, err), http.StatusInternalServerError)
-					return
-				}
-			}
-			channelsz.Count = len(carr)
-			channelsz.Channels = carr
-		} else {
-			carr := make([]string, 0, totalChannels)
-			for cn := range channels {
-				carr = append(carr, cn)
-			}
-			sort.Sort(byName(carr))
-			carr = carr[minoff:maxoff]
-			channelsz.Count = len(carr)
-			channelsz.Names = carr
-		}
-		s.sendResponse(w, r, channelsz)
+		s.handleAllChannels(w, r)
 	}
+}
+
+func (s *StanServer) handleAllChannels(w http.ResponseWriter, r *http.Request) {
+	subsOption, _ := strconv.Atoi(r.URL.Query().Get("subs"))
+	offset, limit := getOffsetAndLimit(r)
+	channels := s.channels.getAll()
+	totalChannels := len(channels)
+	minoff, maxoff := getMinMaxOffset(offset, limit, totalChannels)
+	channelsz := &Channelsz{
+		ClusterID: s.info.ClusterID,
+		ServerID:  s.serverID,
+		Now:       time.Now(),
+		Offset:    offset,
+		Limit:     limit,
+		Total:     totalChannels,
+	}
+	if subsOption == 1 {
+		carr := make([]*Channelz, 0, totalChannels)
+		for cn := range channels {
+			cz := &Channelz{Name: cn}
+			carr = append(carr, cz)
+		}
+		sort.Sort(byChannelName(carr))
+		carr = carr[minoff:maxoff]
+		for _, cz := range carr {
+			cs := channels[cz.Name]
+			if err := updateChannelz(cz, cs, subsOption); err != nil {
+				http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", cz.Name, err), http.StatusInternalServerError)
+				return
+			}
+		}
+		channelsz.Count = len(carr)
+		channelsz.Channels = carr
+	} else {
+		carr := make([]string, 0, totalChannels)
+		for cn := range channels {
+			carr = append(carr, cn)
+		}
+		sort.Sort(byName(carr))
+		carr = carr[minoff:maxoff]
+		channelsz.Count = len(carr)
+		channelsz.Names = carr
+	}
+	s.sendResponse(w, r, channelsz)
 }
 
 func (s *StanServer) handleOneChannel(w http.ResponseWriter, r *http.Request, name string, subsOption int) {
@@ -451,6 +459,66 @@ func (s *StanServer) handleOneChannel(w http.ResponseWriter, r *http.Request, na
 		return
 	}
 	s.sendResponse(w, r, channelz)
+}
+
+func (s *StanServer) handleRESTChannelsz(w http.ResponseWriter, r *http.Request) {
+	uri := strings.TrimPrefix(r.RequestURI, RESTChannelsPath)
+	routes := strings.Split(uri, "/")
+	channel := routes[0]
+	// Remove possible options from channel name
+	optsPos := strings.Index(channel, "?")
+	if optsPos >= 0 {
+		channel = channel[:optsPos]
+	}
+	switch r.Method {
+	case "DELETE":
+		s.handleDeleteChannel(w, r, channel)
+	case "GET":
+		if channel == "" {
+			s.handleAllChannels(w, r)
+		} else {
+			subsOption := 0
+			if len(routes) > 1 && strings.HasPrefix(routes[1], "subs") {
+				subsOption = 1
+			}
+			s.handleOneChannel(w, r, channel, subsOption)
+		}
+	}
+}
+
+func (s *StanServer) handleDeleteChannel(w http.ResponseWriter, r *http.Request, name string) {
+	if !s.opts.EnableAdminControl {
+		http.Error(w, "Administration through monitor endpoints has not been enabled", http.StatusForbidden)
+		return
+	}
+	// Consider ErrChannelIsBeingDeleted OK
+	if err := s.deleteChannel(name); err != nil && err != ErrChannelIsBeingDeleted {
+		var (
+			httpStatus int
+			errTxt     string
+		)
+		switch err {
+		case ErrChannelNotFound:
+			errTxt = fmt.Sprintf("Channel %q not found", name)
+			httpStatus = http.StatusNotFound
+		case ErrOperationTimeout:
+			httpStatus = http.StatusRequestTimeout
+			errTxt = fmt.Sprintf("Channel %q may have not been deleted: %v", name, err)
+		case ErrChannelHasSubscriptions:
+			fallthrough
+		case ErrNotPermittedInPartitioningMode:
+			httpStatus = http.StatusForbidden
+		default:
+			httpStatus = http.StatusInternalServerError
+		}
+		if errTxt == "" {
+			errTxt = fmt.Sprintf("Channel %q cannot be deleted: %v", name, err)
+		}
+		http.Error(w, errTxt, httpStatus)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf("Channel %q has been (or is being) deleted\n", name)))
 }
 
 func updateChannelz(cz *Channelz, c *channel, subsOption int) error {

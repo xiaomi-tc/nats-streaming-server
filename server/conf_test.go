@@ -186,6 +186,9 @@ func TestParseConfig(t *testing.T) {
 	if opts.SQLStoreOpts.MaxOpenConns != 5 {
 		t.Fatalf("Expected SQL MaxOpenConns to be 5, got %v", opts.SQLStoreOpts.MaxOpenConns)
 	}
+	if !opts.EnableAdminControl {
+		t.Fatal("Expected EnableAdminControl to be true, got false")
+	}
 }
 
 func TestParsePermError(t *testing.T) {
@@ -328,6 +331,7 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "ack_subs_pool_size: false", wrongTypeErr)
 	expectFailureFor(t, "ft_group: 123", wrongTypeErr)
 	expectFailureFor(t, "partitioning: 123", wrongTypeErr)
+	expectFailureFor(t, "admin_control: 123", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_channels:false}", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_msgs:false}", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_bytes:false}", wrongTypeErr)

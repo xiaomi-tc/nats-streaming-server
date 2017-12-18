@@ -151,6 +151,30 @@ func (gs *genericStore) CreateChannel(channel string) (*Channel, error) {
 	return nil, nil
 }
 
+// DeleteChannel implements the Store interface
+func (gs *genericStore) DeleteChannel(channel string) error {
+	gs.Lock()
+	err := gs.deleteChannel(channel)
+	gs.Unlock()
+	return err
+}
+
+func (gs *genericStore) deleteChannel(channel string) error {
+	c := gs.channels[channel]
+	if c == nil {
+		return ErrNotFound
+	}
+	err := c.Msgs.Close()
+	if lerr := c.Subs.Close(); lerr != nil && err == nil {
+		err = lerr
+	}
+	if err != nil {
+		return err
+	}
+	delete(gs.channels, channel)
+	return nil
+}
+
 // canAddChannel returns true if the current number of channels is below the limit.
 // If a channel named `channelName` alreadt exists, an error is returned.
 // Store lock is assumed to be locked.
@@ -327,7 +351,7 @@ func (gss *genericSubStore) UpdateSub(sub *spb.SubState) error {
 	return nil
 }
 
-// createSubLocked checks that the number of subscriptions is below the max
+// createSub checks that the number of subscriptions is below the max
 // and if so, assigns a new subscription ID and keep track of it in a map.
 // Lock is assumed to be held on entry.
 func (gss *genericSubStore) createSub(sub *spb.SubState) error {

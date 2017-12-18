@@ -293,6 +293,7 @@ func TestSQLErrorsDueToFailDBConnection(t *testing.T) {
 		_, err := s.CreateChannel("bar")
 		return err
 	})
+	expectToFail(func() error { return s.DeleteChannel("foo") })
 	expectToFail(func() error {
 		_, err := s.AddClient("me", "hbInbox")
 		return err
@@ -1352,4 +1353,76 @@ func TestSQLGetExclusiveLock(t *testing.T) {
 		t.Fatalf("Expected error, got lock=%v err=%v", hasLock, err)
 	}
 	restoreDBConnection(t, s4)
+}
+
+func TestSQLDeleteChannel(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+	cleanupSQLDatastore(t)
+	defer cleanupSQLDatastore(t)
+
+	s := createDefaultSQLStore(t)
+	defer s.Close()
+
+	checkTables := func(channelName string, shouldExist bool) {
+		db := getDBConnection(t)
+		defer db.Close()
+
+		var cid uint64
+		row := db.QueryRow(fmt.Sprintf("SELECT id FROM Channels WHERE name='%s'", channelName))
+		row.Scan(&cid)
+		if shouldExist && cid == 0 {
+			stackFatalf(t, "Channel %q should exist", channelName)
+		} else if !shouldExist && cid != 0 {
+			stackFatalf(t, "Channel %q should not exist", channelName)
+		}
+		var subid uint64
+		row = db.QueryRow(fmt.Sprintf("SELECT subid FROM Subscriptions WHERE id=%v", cid))
+		row.Scan(&subid)
+		if shouldExist && subid == 0 {
+			stackFatalf(t, "Channel %q should have a subscription", channelName)
+		} else if !shouldExist && subid != 0 {
+			stackFatalf(t, "Channel %q should not have a subscription", channelName)
+		}
+		var count int
+		row = db.QueryRow(fmt.Sprintf("SELECT COUNT(seq) FROM Messages WHERE id=%v", cid))
+		row.Scan(&count)
+		if shouldExist && count == 0 {
+			stackFatalf(t, "There should be messages for channel %q", channelName)
+		} else if !shouldExist && count > 0 {
+			stackFatalf(t, "There should be no message for channel %q", channelName)
+		}
+		row = db.QueryRow(fmt.Sprintf("SELECT COUNT(row) FROM SubsPending WHERE subid=%v", subid))
+		row.Scan(&count)
+		if shouldExist && count == 0 {
+			stackFatalf(t, "There should be subspending for channel %q", channelName)
+		} else if !shouldExist && count > 0 {
+			stackFatalf(t, "There should be no subspending for channel %q", channelName)
+		}
+	}
+
+	fooChannel := storeCreateChannel(t, s, "foo")
+	// Add some messages, subscriptions entries, etc...
+	m1 := storeMsg(t, fooChannel, "foo", []byte("msg1"))
+	m2 := storeMsg(t, fooChannel, "foo", []byte("msg2"))
+	subID1 := storeSub(t, fooChannel, "foo")
+	storeSubPending(t, fooChannel, "foo", subID1, m1.Sequence, m2.Sequence)
+	checkTables("foo", true)
+
+	barChannel := storeCreateChannel(t, s, "bar")
+	// Add some messages, subscriptions entries, etc...
+	m1 = storeMsg(t, barChannel, "bar", []byte("msg1"))
+	m2 = storeMsg(t, barChannel, "bar", []byte("msg2"))
+	subID2 := storeSub(t, barChannel, "bar")
+	storeSubPending(t, barChannel, "bar", subID2, m1.Sequence, m2.Sequence)
+	checkTables("bar", true)
+
+	if err := s.DeleteChannel("foo"); err != nil {
+		t.Fatalf("Error deleting channel: %v", err)
+	}
+	// Close store to ensure deep delete of channel
+	s.Close()
+	checkTables("foo", false)
+	checkTables("bar", true)
 }
