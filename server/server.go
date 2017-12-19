@@ -2817,6 +2817,7 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 				// If channel was successfully deleted, we remove the channel
 				// from the stores that need to be flushed.
 				delete(storesToFlush, c)
+				s.log.Noticef("Channel %q has been administratively deleted", iopm.ctd)
 			}
 			return
 		}

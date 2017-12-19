@@ -35,6 +35,7 @@ NATS Streaming provides the following high-level feature set.
     * [Monitoring](#monitoring)
         * [Enabling](#enabling)
         * [Endpoints](#endpoints)
+    * [Administration](#administration)
 - [Getting Started](#getting-started)
     * [Building](#building)
     * [Running](#running)
@@ -753,6 +754,37 @@ For example: [http://localhost:8222/streaming/channelsz?channel=foo&subs=1](http
 }
 ```
 
+## Administration
+
+If monitoring, and the `admin_control` command line (or equivalent configuration) parameter are enabled,
+it is possible to perform administrative tasks.
+
+As of now, the only one supported is deleting a channel. For instance, the following curl command would
+delete the channel named `foo`.
+
+```
+curl -X DELETE http://localhost:8222/channelsz/foo
+```
+
+There are restrictions though. For instance, the server will reject the command if there are any registered subscriptions,
+durable or not, active or offline. So attempting to delete a channel with existing subscriptions would fail
+with message similar to this:
+
+```
+$ curl -X DELETE http://localhost:8222/streaming/channelsz/foo
+Channel "foo" cannot be deleted: channel has subscriptions attached
+```
+
+If there is no subscription, the operation will succeed:
+```
+$ curl -X DELETE http://localhost:8222/streaming/channelsz/foo
+Channel "foo" has been (or is being) deleted
+```
+and the following will be in the server log:
+```
+[45857] 2017/12/18 16:53:27.660563 [INF] STREAM: Channel "foo" has been administratively deleted
+```
+
 # Getting Started
 
 The best way to get the NATS Streaming Server is to use one of the pre-built release binaries which are available for OSX, Linux (x86-64/ARM), Windows. Instructions for using these binaries are on the GitHub releases page.
@@ -887,20 +919,21 @@ Logging Options:
     -DV                              Debug and trace
 
 Authorization Options:
-        --user <string>              User required for connections
-        --pass <string>              Password required for connections
-        --auth <string>              Authorization token required for connections
+    --user <string>                  User required for connections
+    --pass <string>                  Password required for connections
+    --auth <string>                  Authorization token required for connections
+    --admin_control=<bool>           Enable ability to perform administrative tasks through monitor endpoints
 
 TLS Options:
-        --tls=<bool>                 Enable TLS, do not verify clients (default: false)
-        --tlscert <string>           Server certificate file
-        --tlskey <string>            Private key for server certificate
-        --tlsverify=<bool>           Enable TLS, verify client certificates
-        --tlscacert <string>         Client certificate CA for verification
+    --tls=<bool>                     Enable TLS, do not verify clients (default: false)
+    --tlscert <string>               Server certificate file
+    --tlskey <string>                Private key for server certificate
+    --tlsverify=<bool>               Enable TLS, verify client certificates
+    --tlscacert <string>             Client certificate CA for verification
 
 NATS Clustering Options:
-        --routes <string, ...>       Routes to solicit and connect
-        --cluster <string>           Cluster URL for solicited routes
+    --routes <string, ...>           Routes to solicit and connect
+    --cluster <string>               Cluster URL for solicited routes
 
 Common Options:
     -h, --help                       Show this message
@@ -977,6 +1010,7 @@ In general the configuration parameters are the same as the command line argumen
 | ack_subs_pool_size | Normally, when a client creates a subscription, the server creates an internal subscription to receive its ACKs. If lots of subscriptions are created, the number of internal subscriptions in the server could be very high. To curb this growth, use this parameter to configure a pool of internal ACKs subscriptions | Number | `ack_subs_pool_size: 10` |
 | ft_group | In Fault Tolerance mode, you can start a group of streaming servers with only one server being active while others are running in standby mode. This is the name of this FT group | String | `ft_group: "my_ft_group"` |
 | partitioning | If set to true, a list of channels must be defined in store_limits/channels section. This section then serves two purposes, overriding limits for a given channel or adding it to the partition | `true` or `false` | `partitioning: true` |
+| admin_control | If set to true and if a monitoring port is specified, user can perform administrative tasks (such as deleting a channel) | `true` or `false` | `admin_control: true` |
 
 TLS Configuration:
 

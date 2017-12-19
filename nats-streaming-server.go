@@ -85,20 +85,21 @@ Logging Options:
     -DV                              Debug and trace
 
 Authorization Options:
-        --user <string>              User required for connections
-        --pass <string>              Password required for connections
-        --auth <string>              Authorization token required for connections
+    --user <string>                  User required for connections
+    --pass <string>                  Password required for connections
+    --auth <string>                  Authorization token required for connections
+    --admin_control=<bool>           Enable ability to perform administrative tasks through monitor endpoints
 
 TLS Options:
-        --tls=<bool>                 Enable TLS, do not verify clients (default: false)
-        --tlscert <string>           Server certificate file
-        --tlskey <string>            Private key for server certificate
-        --tlsverify=<bool>           Enable TLS, verify client certificates
-        --tlscacert <string>         Client certificate CA for verification
+    --tls=<bool>                     Enable TLS, do not verify clients (default: false)
+    --tlscert <string>               Server certificate file
+    --tlskey <string>                Private key for server certificate
+    --tlsverify=<bool>               Enable TLS, verify client certificates
+    --tlscacert <string>             Client certificate CA for verification
 
 NATS Clustering Options:
-        --routes <string, ...>       Routes to solicit and connect
-        --cluster <string>           Cluster URL for solicited routes
+    --routes <string, ...>           Routes to solicit and connect
+    --cluster <string>               Cluster URL for solicited routes
 
 Common Options:
     -h, --help                       Show this message
