@@ -845,6 +845,10 @@ type Options struct {
 	AckSubsPoolSize    int           // Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription).
 	FTGroupName        string        // Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
 	Partitioning       bool          // Specify if server only accepts messages/subscriptions on channels defined in StoreLimits.
+
+	// 2017-12-28
+	ConsulServerURL    string        // URL for Consul Server to connect to.
+	ConsulUtil         *ConsulUtility // ConsulUtilty for handle register to and unregister from consul server
 }
 
 // Clone returns a deep copy of the Options object.
@@ -1202,9 +1206,29 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 			return nil, err
 		}
 	}
+
+	// 2017-12-28  Register to consul server
+	if _, err := sOpts.ConsulUtil.Register("QBus",sOpts.ID, nOpts.Port, sOpts.ConsulServerURL, s.log); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			// 2017-12-28
+			sOpts.ConsulUtil.UnRegister()
+			s.log.Noticef("Failed to start: %v", r)
+			panic(r)
+		} else if returnedError != nil {
+			// 2017-12-28
+			s.log.Noticef("defer() UnRegister")
+			sOpts.ConsulUtil.UnRegister()
+		}
+	}()
+
+
 	if s.opts.HandleSignals {
 		s.handleSignals()
 	}
+
 	return &s, nil
 }
 
