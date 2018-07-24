@@ -47,7 +47,7 @@ import (
 // Server defaults.
 const (
 	// VERSION is the current version for the NATS Streaming server.
-	VERSION = "0.10.0"
+	VERSION = "0.10.2"
 
 	DefaultClusterID      = "test-cluster"
 	DefaultDiscoverPrefix = "_STAN.discover"
@@ -174,12 +174,10 @@ var (
 var clientIDRegEx *regexp.Regexp
 
 var (
-	testAckWaitIsInMillisecond     bool
-	clientCheckTimeout             = defaultClientCheckTimeout
-	lazyReplicationInterval        = defaultLazyReplicationInterval
-	testDeleteChannel              bool
-	pingResponseOKBytes            []byte
-	pingResponseInvalidClientBytes []byte
+	testAckWaitIsInMillisecond bool
+	clientCheckTimeout         = defaultClientCheckTimeout
+	lazyReplicationInterval    = defaultLazyReplicationInterval
+	testDeleteChannel          bool
 )
 
 func computeAckWait(wait int32) time.Duration {
@@ -629,6 +627,11 @@ type StanServer struct {
 	subCloseSub *nats.Subscription
 	subUnsubSub *nats.Subscription
 	cliPingSub  *nats.Subscription
+
+	// For sending responses to client PINGS. Used to be global but would
+	// cause races when running more than 1 server in a program or test.
+	pingResponseOKBytes            []byte
+	pingResponseInvalidClientBytes []byte
 }
 
 type lazyReplication struct {
@@ -737,7 +740,10 @@ func (ss *subStore) Store(sub *subState) error {
 	// the code, so we don't need locking.
 
 	// Adds to storage.
+	// Use sub lock to avoid race with waitForAcks in some tests
+	sub.Lock()
 	err := sub.store.CreateSub(&sub.SubState)
+	sub.Unlock()
 	if err != nil {
 		ss.stan.log.Errorf("Unable to store subscription [%v:%v] on [%s]: %v", sub.ClientID, sub.Inbox, sub.subject, err)
 		return err
@@ -782,22 +788,23 @@ func (ss *subStore) updateState(sub *subState) {
 			ss.acks[sub.AckInbox] = sub
 
 			qs.subs = append(qs.subs, sub)
+
+			// If the added sub has newOnHold it means that we are doing recovery and
+			// that this member had unacknowledged messages. Mark the queue group
+			// with newOnHold
+			if sub.newOnHold {
+				qs.newOnHold = true
+			}
+			// Update stalled (on recovery)
+			if sub.stalled {
+				qs.stalledSubCount++
+			}
 		}
 		// Needed in the case of server restart, where
 		// the queue group's last sent needs to be updated
 		// based on the recovered subscriptions.
 		if sub.LastSent > qs.lastSent {
 			qs.lastSent = sub.LastSent
-		}
-		// If the added sub has newOnHold it means that we are doing recovery and
-		// that this member had unacknowledged messages. Mark the queue group
-		// with newOnHold
-		if sub.newOnHold {
-			qs.newOnHold = true
-		}
-		// Update stalled (on recovery)
-		if sub.stalled {
-			qs.stalledSubCount++
 		}
 		qs.Unlock()
 		sub.qstate = qs
@@ -1765,7 +1772,10 @@ func (s *StanServer) start(runningState State) error {
 	// clustered, the leader will handle redelivery upon election.
 	if !s.isClustered {
 		s.wg.Add(1)
-		go s.performRedeliveryOnStartup(recoveredSubs)
+		go func() {
+			s.performRedeliveryOnStartup(recoveredSubs)
+			s.wg.Done()
+		}()
 	}
 	return nil
 }
@@ -1895,25 +1905,25 @@ func (s *StanServer) leadershipAcquired() error {
 		return err
 	}
 
+	var allSubs []*subState
 	for _, c := range channels {
 		// Subscribe to channel snapshot restore subject
 		if err := c.subToSnapshotRestoreRequests(); err != nil {
 			return err
 		}
-
-		allSubs := c.ss.getAllSubs()
-		// Attempt to redeliver outstanding messages that have expired.
-		for _, sub := range allSubs {
-			sub.Lock()
-			sub.initialized = true
-			sub.Unlock()
-			s.performAckExpirationRedelivery(sub, true)
+		subs := c.ss.getAllSubs()
+		if len(subs) > 0 {
+			allSubs = append(allSubs, subs...)
 		}
-		// If this channel has a MaxInactivity, check if we should start
-		// its delete timer.
 		if c.activity != nil {
 			s.channels.maybeStartChannelDeleteTimer(c.name, c)
 		}
+	}
+	if len(allSubs) > 0 {
+		s.startGoRoutine(func() {
+			s.performRedeliveryOnStartup(allSubs)
+			s.wg.Done()
+		})
 	}
 
 	if err := s.nc.Flush(); err != nil {
@@ -2179,9 +2189,10 @@ func (s *StanServer) recoverOneSub(c *channel, recSub *spb.SubState, pendingAcks
 
 	// Create a subState
 	sub := &subState{
-		subject: c.name,
-		ackWait: computeAckWait(recSub.AckWaitInSecs),
-		store:   c.store.Subs,
+		SubState: *recSub,
+		subject:  c.name,
+		ackWait:  computeAckWait(recSub.AckWaitInSecs),
+		store:    c.store.Subs,
 	}
 	// Depending from where this function is called, we are given
 	// a map[uint64]struct{} or a []uint64.
@@ -2205,8 +2216,6 @@ func (s *StanServer) recoverOneSub(c *channel, recSub *spb.SubState, pendingAcks
 			sub.stalled = true
 		}
 	}
-	// Copy over fields from SubState protobuf
-	sub.SubState = *recSub
 	// When recovering older stores, IsDurable may not exist for
 	// durable subscribers. Set it now.
 	durableSub := sub.isDurableSubscriber() // not a durable queue sub!
@@ -2281,19 +2290,16 @@ func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, r
 	}
 }
 
-// Redelivers unacknowledged messages and release the hold for new messages delivery
+// Redelivers unacknowledged messages, releases the hold for new messages delivery,
+// and kicks delivery of available messages.
 func (s *StanServer) performRedeliveryOnStartup(recoveredSubs []*subState) {
-	defer s.wg.Done()
-
 	queues := make(map[*queueState]*channel)
 
 	for _, sub := range recoveredSubs {
 		// Ignore subs that did not have any ack pendings on startup.
 		sub.Lock()
-		if !sub.newOnHold {
-			sub.Unlock()
-			continue
-		}
+		// Consider this subscription ready to receive messages
+		sub.initialized = true
 		// If this is a durable and it is offline, then skip the rest.
 		if sub.isOfflineDurableSubscriber() {
 			sub.newOnHold = false
@@ -2705,6 +2711,10 @@ func (s *StanServer) processConnect(req *pb.ConnectRequest, replaceOld bool) err
 }
 
 func (s *StanServer) finishConnectRequest(req *pb.ConnectRequest, replyInbox string) {
+	clientID := req.ClientID
+	// Heartbeat timer.
+	s.clients.setClientHB(clientID, s.opts.ClientHBInterval, func() { s.checkClientHealth(clientID) })
+
 	cr := &pb.ConnectResponse{
 		PubPrefix:        s.info.Publish,
 		SubRequests:      s.info.Subscribe,
@@ -2727,10 +2737,6 @@ func (s *StanServer) finishConnectRequest(req *pb.ConnectRequest, replyInbox str
 	}
 	b, _ := cr.Marshal()
 	s.nc.Publish(replyInbox, b)
-
-	clientID := req.ClientID
-	// Heartbeat timer.
-	s.clients.setClientHB(clientID, s.opts.ClientHBInterval, func() { s.checkClientHealth(clientID) })
 }
 
 func (s *StanServer) sendConnectErr(replyInbox, err string) {
@@ -2956,13 +2962,9 @@ func (s *StanServer) processClientPings(m *nats.Msg) {
 	if err := ping.Unmarshal(m.Data); err != nil {
 		return
 	}
-	var (
-		valid bool
-		reply []byte
-	)
+	var reply []byte
 	client := s.clients.lookupByConnID(ping.ConnID)
 	if client != nil {
-		valid = true
 		// If the client has failed heartbeats and since the
 		// server just received a PING from the client, reset
 		// the server-to-client HB timer so that a PING is
@@ -2976,20 +2978,18 @@ func (s *StanServer) processClientPings(m *nats.Msg) {
 			client.hbt.Reset(time.Millisecond)
 			client.Unlock()
 		}
-	}
-	if valid {
-		if pingResponseOKBytes == nil {
-			pingResponseOKBytes, _ = (&pb.PingResponse{}).Marshal()
+		if s.pingResponseOKBytes == nil {
+			s.pingResponseOKBytes, _ = (&pb.PingResponse{}).Marshal()
 		}
-		reply = pingResponseOKBytes
+		reply = s.pingResponseOKBytes
 	} else {
-		if pingResponseInvalidClientBytes == nil {
+		if s.pingResponseInvalidClientBytes == nil {
 			pingError := &pb.PingResponse{
 				Error: "client has been replaced or is no longer registered",
 			}
-			pingResponseInvalidClientBytes, _ = pingError.Marshal()
+			s.pingResponseInvalidClientBytes, _ = pingError.Marshal()
 		}
-		reply = pingResponseInvalidClientBytes
+		reply = s.pingResponseInvalidClientBytes
 	}
 	s.ncs.Publish(m.Reply, reply)
 }
@@ -3157,28 +3157,26 @@ func (s *StanServer) performDurableRedelivery(c *channel, sub *subState) {
 	}
 
 	// If we don't find the client, we are done.
-	client := s.clients.lookup(clientID)
-	if client == nil {
-		return
-	}
-	// Go through all messages
-	for _, seq := range sortedSeqs {
-		m := s.getMsgForRedelivery(c, sub, seq)
-		if m == nil {
-			continue
+	if s.clients.lookup(clientID) != nil {
+		// Go through all messages
+		for _, seq := range sortedSeqs {
+			m := s.getMsgForRedelivery(c, sub, seq)
+			if m == nil {
+				continue
+			}
+
+			if s.trace {
+				s.log.Tracef("[Client:%s] Redelivering to subid=%d, seq=%d", clientID, subID, m.Sequence)
+			}
+
+			// Flag as redelivered.
+			m.Redelivered = true
+
+			sub.Lock()
+			// Force delivery
+			s.sendMsgToSub(sub, m, forceDelivery)
+			sub.Unlock()
 		}
-
-		if s.trace {
-			s.log.Tracef("[Client:%s] Redelivering to subid=%d, seq=%d", clientID, subID, m.Sequence)
-		}
-
-		// Flag as redelivered.
-		m.Redelivered = true
-
-		sub.Lock()
-		// Force delivery
-		s.sendMsgToSub(sub, m, forceDelivery)
-		sub.Unlock()
 	}
 	// Release newOnHold if needed.
 	if newOnHold {
@@ -3238,11 +3236,13 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 	// limit is now plus a buffer of 15ms to avoid repeated timer callbacks.
 	limit := now + int64(15*time.Millisecond)
 
-	var pick *subState
-	sent := false
-	needToSetExpireTime := false
-	tracePrinted := false
-	nextExpirationTIme := int64(0)
+	var (
+		pick               *subState
+		sent               bool
+		tracePrinted       bool
+		foundWithZero      bool
+		nextExpirationTime int64
+	)
 
 	// We will move through acksPending(sorted) and see what needs redelivery.
 	for _, pm := range sortedPendingMsgs {
@@ -3250,31 +3250,27 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 		if m == nil {
 			continue
 		}
-		expireTime := pm.expire
-		if expireTime == 0 {
-			needToSetExpireTime = true
-			expireTime = m.Timestamp + expTime
-		}
-
-		// If this message has not yet expired, reset timer for next callback
-		if expireTime > limit {
-			if nextExpirationTIme == 0 {
-				nextExpirationTIme = expireTime
-			}
-			if !tracePrinted && s.trace {
-				tracePrinted = true
-				s.log.Tracef("[Client:%s] Redelivery for subid=%d, skipping seq=%d", clientID, subID, m.Sequence)
-			}
-			if needToSetExpireTime {
+		// If we found any pm.expire with 0 in the array (due to a server restart),
+		// ensure that all have now an expiration set, then reschedule right away.
+		if foundWithZero || pm.expire == 0 {
+			foundWithZero = true
+			if pm.expire == 0 {
 				sub.Lock()
 				// Is message still pending?
 				if _, present := sub.acksPending[pm.seq]; present {
-					// Update expireTime
-					expireTime = time.Now().UnixNano() + expTime
-					sub.acksPending[pm.seq] = expireTime
+					sub.acksPending[pm.seq] = m.Timestamp + expTime
 				}
 				sub.Unlock()
-				continue
+			}
+			continue
+		}
+
+		// If this message has not yet expired, reset timer for next callback
+		if pm.expire > limit {
+			nextExpirationTime = pm.expire
+			if !tracePrinted && s.trace {
+				tracePrinted = true
+				s.log.Tracef("[Client:%s] Redelivery for subid=%d, skipping seq=%d", clientID, subID, m.Sequence)
 			}
 			break
 		}
@@ -3307,9 +3303,15 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 			sub.Unlock()
 		}
 	}
+	if foundWithZero {
+		// Restart expiration now that ackPending map's expire values are properly
+		// set. Note that messages may have been added/removed in the meantime.
+		s.performAckExpirationRedelivery(sub, isStartup)
+		return
+	}
 
 	// Adjust the timer
-	sub.adjustAckTimer(nextExpirationTIme)
+	sub.adjustAckTimer(nextExpirationTime)
 }
 
 // getMsgForRedelivery looks up the message from storage. If not found -
@@ -4170,7 +4172,7 @@ func durableKey(sr *pb.SubscriptionRequest) string {
 
 // replicateSub replicates the SubscriptionRequest to nodes in the cluster via
 // Raft.
-func (s *StanServer) replicateSub(sr *pb.SubscriptionRequest, ackInbox string) (*channel, *subState, error) {
+func (s *StanServer) replicateSub(sr *pb.SubscriptionRequest, ackInbox string) (*subState, error) {
 	op := &spb.RaftOperation{
 		OpType: spb.RaftOperation_Subscribe,
 		Sub: &spb.AddSubscription{
@@ -4185,10 +4187,10 @@ func (s *StanServer) replicateSub(sr *pb.SubscriptionRequest, ackInbox string) (
 	// Replicate operation and wait on result.
 	future := s.raft.Apply(data, 0)
 	if err := future.Error(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	rs := future.Response().(*replicatedSub)
-	return rs.c, rs.sub, rs.err
+	return rs.sub, rs.err
 }
 
 // addSubscription adds `sub` to the client and store.
@@ -4208,6 +4210,10 @@ func (s *StanServer) addSubscription(ss *subStore, sub *subState) error {
 // updateDurable adds back `sub` to the client and updates the store.
 // No lock is needed for `sub` since it has just been created.
 func (s *StanServer) updateDurable(ss *subStore, sub *subState) error {
+	// Reset the hasFailedHB boolean since it may have been set
+	// if the client previously crashed and server set this
+	// flag to its subs.
+	sub.hasFailedHB = false
 	// Store in the client
 	if !s.clients.addSub(sub.ClientID, sub) {
 		return fmt.Errorf("can't find clientID: %v", sub.ClientID)
@@ -4230,11 +4236,15 @@ func (s *StanServer) updateDurable(ss *subStore, sub *subState) error {
 }
 
 // processSub adds the subscription to the server.
-func (s *StanServer) processSub(sr *pb.SubscriptionRequest, ackInbox string) (*channel, *subState, error) {
-	c, err := s.lookupOrCreateChannel(sr.Subject)
-	if err != nil {
-		s.log.Errorf("Unable to create channel for subscription on %q", sr.Subject)
-		return nil, nil, err
+func (s *StanServer) processSub(c *channel, sr *pb.SubscriptionRequest, ackInbox string) (*subState, error) {
+	// If channel not provided, we have to look it up
+	var err error
+	if c == nil {
+		c, err = s.lookupOrCreateChannel(sr.Subject)
+		if err != nil {
+			s.log.Errorf("Unable to create channel for subscription on %q", sr.Subject)
+			return nil, err
+		}
 	}
 	var (
 		sub *subState
@@ -4253,7 +4263,7 @@ func (s *StanServer) processSub(sr *pb.SubscriptionRequest, ackInbox string) (*c
 			if strings.Contains(sr.DurableName, ":") {
 				s.log.Errorf("[Client:%s] Invalid DurableName (%q) for queue subscriber from %s",
 					sr.ClientID, sr.DurableName, sr.Subject)
-				return c, nil, ErrInvalidDurName
+				return nil, ErrInvalidDurName
 			}
 			isDurable = true
 			// Make the queue group a compound name between durable name and q group.
@@ -4284,7 +4294,7 @@ func (s *StanServer) processSub(sr *pb.SubscriptionRequest, ackInbox string) (*c
 			sub.RUnlock()
 			if clientID != "" {
 				s.log.Errorf("[Client:%s] Duplicate durable subscription registration", sr.ClientID)
-				return c, nil, ErrDupDurable
+				return nil, ErrDupDurable
 			}
 			setStartPos = false
 		}
@@ -4345,7 +4355,11 @@ func (s *StanServer) processSub(sr *pb.SubscriptionRequest, ackInbox string) (*c
 
 		if setStartPos {
 			// set the start sequence of the subscriber.
-			subStartTrace, err = s.setSubStartSequence(c, sub, sr)
+			var lastSent uint64
+			subStartTrace, lastSent, err = s.setSubStartSequence(c, sr)
+			if err == nil {
+				sub.LastSent = lastSent
+			}
 		}
 
 		if err == nil {
@@ -4368,7 +4382,7 @@ func (s *StanServer) processSub(sr *pb.SubscriptionRequest, ackInbox string) (*c
 		ss.Remove(c, sub, false)
 		s.closeMu.Unlock()
 		s.log.Errorf("Unable to add subscription for %s: %v", sr.Subject, err)
-		return c, nil, err
+		return nil, err
 	}
 	if s.debug {
 		traceCtx := subStateTraceCtx{clientID: sr.ClientID, isNew: subIsNew, startTrace: subStartTrace}
@@ -4379,7 +4393,7 @@ func (s *StanServer) processSub(sr *pb.SubscriptionRequest, ackInbox string) (*c
 	s.numSubs++
 	s.monMu.Unlock()
 
-	return c, sub, nil
+	return sub, nil
 }
 
 // processSubscriptionRequest will process a subscription request.
@@ -4450,24 +4464,45 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 		}
 	}
 
-	// Keep the channel delete mutex to ensure that channel cannot be
-	// deleted while we are about to add a subscription.
-	s.channels.lockDelete()
-	defer s.channels.unlockDelete()
-
 	var (
-		c        *channel
 		sub      *subState
 		ackInbox = nats.NewInbox()
 	)
 
-	// If clustered, thread operations through Raft.
-	if s.isClustered {
-		c, sub, err = s.replicateSub(sr, ackInbox)
-	} else {
-		c, sub, err = s.processSub(sr, ackInbox)
-	}
+	c, err := s.lookupOrCreateChannel(sr.Subject)
+	if err == nil {
+		// Keep the channel delete mutex to ensure that channel cannot be
+		// deleted while we are about to add a subscription.
+		s.channels.lockDelete()
+		defer s.channels.unlockDelete()
 
+		// If clustered, thread operations through Raft.
+		if s.isClustered {
+			// For start requests other than SequenceStart, we MUST convert the request
+			// to a SequenceStart, otherwise, during the replay on server restart, the
+			// subscription would be created with whatever is the seq at that time.
+			// For instance, a request with new-only could originally be created with
+			// the current max seq of 100, but when the cluster is restarted and sub
+			// request is replayed, the channel's current max may be 200, which
+			// would cause the subscription to be created at start 200, which could cause
+			// subscription to miss all messages in between.
+			if sr.StartPosition != pb.StartPosition_SequenceStart {
+				// Figure out what the sequence should be based on orinal StartPosition
+				// request.
+				var seq uint64
+				_, seq, err = s.setSubStartSequence(c, sr)
+				if err == nil {
+					// Convert to a SequenceStart start position with the proper sequence
+					// number.
+					sr.StartPosition = pb.StartPosition_SequenceStart
+					sr.StartSequence = seq
+				}
+			}
+			sub, err = s.replicateSub(sr, ackInbox)
+		} else {
+			sub, err = s.processSub(c, sr, ackInbox)
+		}
+	}
 	if err != nil {
 		s.sendSubscriptionResponseErr(m.Reply, err)
 		return
@@ -4679,6 +4714,12 @@ func (s *StanServer) sendAvailableMessagesToQueue(c *channel, qs *queueState) {
 	}
 
 	qs.Lock()
+	// Short circuit if no active members
+	if len(qs.subs) == 0 {
+		qs.Unlock()
+		return
+	}
+	// If redelivery at startup in progress, don't attempt to deliver new messages
 	if qs.newOnHold {
 		qs.Unlock()
 		return
@@ -4740,10 +4781,7 @@ func (s *StanServer) getNextMsg(c *channel, nextSeq, lastSent *uint64) *pb.MsgPr
 }
 
 // Setup the start position for the subscriber.
-func (s *StanServer) setSubStartSequence(c *channel, sub *subState, sr *pb.SubscriptionRequest) (string, error) {
-	sub.Lock()
-	defer sub.Unlock()
-
+func (s *StanServer) setSubStartSequence(c *channel, sr *pb.SubscriptionRequest) (string, uint64, error) {
 	lastSent := uint64(0)
 	debugTrace := ""
 
@@ -4755,7 +4793,7 @@ func (s *StanServer) setSubStartSequence(c *channel, sub *subState, sr *pb.Subsc
 		var err error
 		lastSent, err = c.store.Msgs.LastSequence()
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		if s.debug {
 			debugTrace = fmt.Sprintf("new-only, seq=%d", lastSent+1)
@@ -4763,7 +4801,7 @@ func (s *StanServer) setSubStartSequence(c *channel, sub *subState, sr *pb.Subsc
 	case pb.StartPosition_LastReceived:
 		lastSeq, err := c.store.Msgs.LastSequence()
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		if lastSeq > 0 {
 			lastSent = lastSeq - 1
@@ -4776,7 +4814,7 @@ func (s *StanServer) setSubStartSequence(c *channel, sub *subState, sr *pb.Subsc
 		// If there is no message, seq will be 0.
 		seq, err := c.store.Msgs.GetSequenceFromTimestamp(startTime)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		if seq > 0 {
 			// If the time delta is in the future relative to the last
@@ -4791,7 +4829,7 @@ func (s *StanServer) setSubStartSequence(c *channel, sub *subState, sr *pb.Subsc
 		// If there is no message, firstSeq and lastSeq will be equal to 0.
 		firstSeq, lastSeq, err := c.store.Msgs.FirstAndLastSequence()
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		// StartSequence is an uint64, so can't be lower than 0.
 		if sr.StartSequence < firstSeq {
@@ -4811,7 +4849,7 @@ func (s *StanServer) setSubStartSequence(c *channel, sub *subState, sr *pb.Subsc
 	case pb.StartPosition_First:
 		firstSeq, err := c.store.Msgs.FirstSequence()
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		if firstSeq > 0 {
 			lastSent = firstSeq - 1
@@ -4820,8 +4858,7 @@ func (s *StanServer) setSubStartSequence(c *channel, sub *subState, sr *pb.Subsc
 			debugTrace = fmt.Sprintf("from beginning, seq=%d", lastSent+1)
 		}
 	}
-	sub.LastSent = lastSent
-	return debugTrace, nil
+	return debugTrace, lastSent, nil
 }
 
 // startGoRoutine starts the given function as a go routine if and only if
