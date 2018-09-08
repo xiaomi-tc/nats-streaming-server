@@ -47,7 +47,7 @@ import (
 // Server defaults.
 const (
 	// VERSION is the current version for the NATS Streaming server.
-	VERSION = "0.10.2"
+	VERSION = "0.11.0"
 
 	DefaultClusterID      = "test-cluster"
 	DefaultDiscoverPrefix = "_STAN.discover"
@@ -1117,6 +1117,7 @@ type Options struct {
 	ClientHBFailCount  int           // Number of failed heartbeats before server closes client connection.
 	FTGroupName        string        // Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
 	Partitioning       bool          // Specify if server only accepts messages/subscriptions on channels defined in StoreLimits.
+	SyslogName         string        // Optional name for the syslog (usueful on Windows when running several servers as a service)
 	Clustering         ClusteringOptions
 
 	// 2018-06-13
@@ -1405,7 +1406,7 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 	// If a custom logger is provided, use this one, otherwise, check
 	// if we should configure the logger or not.
 	if sOpts.CustomLogger != nil {
-		s.log.SetLogger(sOpts.CustomLogger, sOpts.Debug, sOpts.Trace)
+		s.log.SetLogger(sOpts.CustomLogger, nOpts.Logtime, sOpts.Debug, sOpts.Trace, "")
 	} else if sOpts.EnableLogging {
 		s.configureLogger()
 	}
@@ -1569,11 +1570,23 @@ func (s *StanServer) configureLogger() {
 	enableDebug := nOpts.Debug || sOpts.Debug
 	enableTrace := nOpts.Trace || sOpts.Trace
 
+	syslog := nOpts.Syslog
+	// Enable syslog if no log file is specified and we're running as a
+	// Windows service so that logs are written to the Windows event log.
+	if isWindowsService() && nOpts.LogFile == "" {
+		syslog = true
+	}
+	// If we have a syslog name specified, make sure we will use this name.
+	// This is for syslog and remote syslogs running on Windows.
+	if sOpts.SyslogName != "" {
+		natsdLogger.SetSyslogName(sOpts.SyslogName)
+	}
+
 	if nOpts.LogFile != "" {
 		newLogger = natsdLogger.NewFileLogger(nOpts.LogFile, nOpts.Logtime, enableDebug, enableTrace, true)
 	} else if nOpts.RemoteSyslog != "" {
 		newLogger = natsdLogger.NewRemoteSysLogger(nOpts.RemoteSyslog, enableDebug, enableTrace)
-	} else if nOpts.Syslog {
+	} else if syslog {
 		newLogger = natsdLogger.NewSysLogger(enableDebug, enableTrace)
 	} else {
 		colors := true
@@ -1586,7 +1599,7 @@ func (s *StanServer) configureLogger() {
 		newLogger = natsdLogger.NewStdLogger(nOpts.Logtime, enableDebug, enableTrace, colors, true)
 	}
 
-	s.log.SetLogger(newLogger, sOpts.Debug, sOpts.Trace)
+	s.log.SetLogger(newLogger, nOpts.Logtime, sOpts.Debug, sOpts.Trace, nOpts.LogFile)
 }
 
 // This is either running inside RunServerWithOpts() and before any reference
@@ -2863,24 +2876,18 @@ func (s *StanServer) processCloseRequest(m *nats.Msg) {
 		return
 	}
 
-	s.nc.Barrier(func() {
-		// Ensure all pending acks are received by the connection
-		s.nca.Flush()
-		// Then ensure that all acks have been processed in processAckMsg callbacks
-		// before executing the closing function.
-		s.nca.Barrier(func() {
-			var err error
-			// If clustered, thread operations through Raft.
-			if s.isClustered {
-				err = s.replicateConnClose(req)
-			} else {
-				err = s.closeClient(req.ClientID)
-			}
-			// If there was an error, it has been already logged.
+	s.barrier(func() {
+		var err error
+		// If clustered, thread operations through Raft.
+		if s.isClustered {
+			err = s.replicateConnClose(req)
+		} else {
+			err = s.closeClient(req.ClientID)
+		}
+		// If there was an error, it has been already logged.
 
-			// Send response, if err is nil, will be a success response.
-			s.sendCloseResponse(m.Reply, err)
-		})
+		// Send response, if err is nil, will be a success response.
+		s.sendCloseResponse(m.Reply, err)
 	})
 }
 
@@ -3943,6 +3950,25 @@ func (s *StanServer) processSubCloseRequest(m *nats.Msg) {
 	s.performmUnsubOrCloseSubscription(m, req, true)
 }
 
+// Used when processing protocol messages to guarantee ordering.
+// Since protocols handlers use different subscriptions, a client
+// may send a message then close the connection, but those protocols
+// are processed by different internal subscriptions in the server.
+// Using nats's Conn.Barrier() we ensure that messages have been
+// processed in their respective callbacks before invoking `f`.
+// Since we also use a separate connection to handle acks, we
+// also need to flush the connection used to process ack's and
+// chained Barrier calls between s.nc and s.nca.
+func (s *StanServer) barrier(f func()) {
+	s.nc.Barrier(func() {
+		// Ensure all pending acks are received by the connection
+		s.nca.Flush()
+		// Then ensure that all acks have been processed in processAckMsg callbacks
+		// before executing the closing function.
+		s.nca.Barrier(f)
+	})
+}
+
 // performmUnsubOrCloseSubscription processes the unsub or close subscription
 // request.
 func (s *StanServer) performmUnsubOrCloseSubscription(m *nats.Msg, req *pb.UnsubscribeRequest, isSubClose bool) {
@@ -3955,7 +3981,7 @@ func (s *StanServer) performmUnsubOrCloseSubscription(m *nats.Msg, req *pb.Unsub
 		}
 	}
 
-	s.nc.Barrier(func() {
+	s.barrier(func() {
 		var err error
 		if s.isClustered {
 			if isSubClose {
