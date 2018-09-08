@@ -20,6 +20,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1937,6 +1938,7 @@ func TestClusteringLogSnapshotRestoreBatching(t *testing.T) {
 	follower.opts.Clustering.RaftLogging = true
 	follower.opts.CustomLogger = cl
 	follower = runServerWithOpts(t, follower.opts, nil)
+	defer follower.Shutdown()
 	servers = append(servers, follower)
 
 	getLeader(t, 10*time.Second, servers...)
@@ -3419,6 +3421,9 @@ func TestClusteringNodeIDInPeersArray(t *testing.T) {
 }
 
 func TestClusteringUnableToContactPeer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.SkipNow()
+	}
 	cleanupDatastore(t)
 	defer cleanupDatastore(t)
 	cleanupRaftLog(t)
@@ -3508,4 +3513,248 @@ func TestClusteringClientPings(t *testing.T) {
 	leader := getLeader(t, 10*time.Second, servers...)
 
 	testClientPings(t, leader)
+}
+
+func TestClusteringSubCorrectStartSeqAfterClusterRestart(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	servers := []*StanServer{s1, s2}
+	// Wait for leader to be elected.
+	getLeader(t, 10*time.Second, servers...)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	msgCh := make(chan *stan.Msg, 1)
+	// Create a durable subscription with new-only
+	dur, err := sc.Subscribe("foo", func(m *stan.Msg) {
+		msgCh <- m
+	}, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	// Produce a message, since sub was created before, message should be received.
+	if err := sc.Publish("foo", []byte("1")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	select {
+	case msg := <-msgCh:
+		assertMsg(t, msg.MsgProto, []byte("1"), 1)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected msg")
+	}
+	// Wait for acks to be processed on both servers
+	waitForAcks(t, s1, clientName, 1, 0)
+	waitForAcks(t, s2, clientName, 1, 0)
+	// Close durable
+	dur.Close()
+	// Produce 2 more messages
+	for i := 0; i < 2; i++ {
+		if err := sc.Publish("foo", []byte(fmt.Sprintf("%d", i+2))); err != nil {
+			t.Fatalf("Error on publish: %v", err)
+		}
+	}
+	// Close client connection so it does not try to reconnect, which would
+	// slow down test.
+	sc.Close()
+
+	// Restart the cluster
+	s1.Shutdown()
+	s2.Shutdown()
+	s1 = runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+	s2 = runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	// Wait for leader to be elected.
+	servers = []*StanServer{s1, s2}
+	getLeader(t, 10*time.Second, servers...)
+
+	// Recreate client connection
+	sc = NewDefaultConnection(t)
+	defer sc.Close()
+
+	// Restart the durable
+	if _, err := sc.Subscribe("foo", func(m *stan.Msg) {
+		msgCh <- m
+	}, stan.DurableName("dur")); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case msg := <-msgCh:
+			assertMsg(t, msg.MsgProto, []byte(fmt.Sprintf("%d", i+2)), uint64(i+2))
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected msg")
+		}
+	}
+}
+
+func TestClusteringLogSnapshotRestoreQueueGroupSubNewOnHold(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	servers := []*StanServer{s1, s2}
+	// Wait for leader to be elected.
+	getLeader(t, 10*time.Second, servers...)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	clientName2 := clientName + "2"
+	sc2, err := stan.Connect(clusterName, clientName2)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer sc2.Close()
+
+	msgCh := make(chan *stan.Msg, 1)
+	msgCh2 := make(chan *stan.Msg, 1)
+	// Create a durable queue subscription, don't ack the message
+	qsub, err := sc.QueueSubscribe("foo", "bar",
+		func(m *stan.Msg) {
+			msgCh <- m
+		},
+		stan.DurableName("dur"),
+		stan.SetManualAckMode(),
+		stan.MaxInflight(1))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	if _, err := sc2.QueueSubscribe("foo", "baz",
+		func(m *stan.Msg) {
+			msgCh2 <- m
+		},
+		stan.DurableName("dur"),
+		stan.SetManualAckMode(),
+		stan.MaxInflight(1),
+		stan.AckWait(ackWaitInMs(750))); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	// Ensure subs are registered
+	waitForNumSubs(t, s1, clientName, 1)
+	waitForNumSubs(t, s2, clientName, 1)
+
+	waitForNumSubs(t, s1, clientName2, 1)
+	waitForNumSubs(t, s2, clientName2, 1)
+
+	// Produce a message
+	if err := sc.Publish("foo", []byte("1")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	select {
+	case msg := <-msgCh:
+		assertMsg(t, msg.MsgProto, []byte("1"), 1)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected msg")
+	}
+	select {
+	case msg := <-msgCh2:
+		assertMsg(t, msg.MsgProto, []byte("1"), 1)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected msg")
+	}
+
+	// Ensure both servers have the pending msg
+	waitForAcks(t, s1, clientName, 1, 1)
+	waitForAcks(t, s2, clientName, 1, 1)
+
+	waitForAcks(t, s1, clientName2, 2, 1)
+	waitForAcks(t, s2, clientName2, 2, 1)
+
+	// Close queue sub
+	qsub.Close()
+
+	// Wait for subs to be closed
+	waitForNumSubs(t, s1, clientName, 0)
+	waitForNumSubs(t, s2, clientName, 0)
+
+	// Cause snapshot on both servers
+	if err := s1.raft.Snapshot().Error(); err != nil {
+		t.Fatalf("Error during snapshot: %v", err)
+	}
+	if err := s2.raft.Snapshot().Error(); err != nil {
+		t.Fatalf("Error during snapshot: %v", err)
+	}
+
+	// Close client
+	sc.Close()
+
+	// Restart servers
+	s1.Shutdown()
+	s2.Shutdown()
+
+	s1 = runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+	s2 = runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+	servers = []*StanServer{s1, s2}
+	getLeader(t, 10*time.Second, servers...)
+
+	// Create connection again
+	sc = NewDefaultConnection(t)
+	defer sc.Close()
+
+	// Produce 1 more message
+	if err := sc.Publish("foo", []byte("2")); err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	// Reopen queue durable, with auto-ack, first message should be
+	// redelivered followed by new message
+	if _, err := sc.QueueSubscribe("foo", "bar", func(m *stan.Msg) {
+		msgCh <- m
+	}, stan.DurableName("dur")); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	for i := uint64(1); i < 3; i++ {
+		select {
+		case msg := <-msgCh:
+			assertMsg(t, msg.MsgProto, []byte(fmt.Sprintf("%v", i)), i)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected msg %v", i)
+		}
+	}
+	for i := uint64(1); i < 3; i++ {
+		select {
+		case msg := <-msgCh2:
+			assertMsg(t, msg.MsgProto, []byte(fmt.Sprintf("%v", i)), i)
+			msg.Ack()
+		case <-time.After(15 * time.Second):
+			t.Fatalf("expected msg %v", i)
+		}
+	}
 }
