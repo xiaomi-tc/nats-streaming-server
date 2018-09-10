@@ -32,7 +32,7 @@ func init() {
 // Signal Handling
 func (s *StanServer) handleSignals() {
 	c := make(chan os.Signal, 1)
-	//2018-09-08
+	//2018-09-10
 	//signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGHUP)
     signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGHUP,syscall.SIGKILL, syscall.SIGQUIT, )
 	go func() {
@@ -41,10 +41,11 @@ func (s *StanServer) handleSignals() {
 			// registered, so we don't need a "default" in the
 			// switch statement.
 			switch sig {
-			case syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGQUIT:
+			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGQUIT:
                 //2018-06-13
                 s.log.Noticef("get signal:%v, will UnRegister()", sig)
                 s.opts.ConsulUtil.UnRegister()
+
 				s.Shutdown()
 				os.Exit(0)
 			case syscall.SIGUSR1:
