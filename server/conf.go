@@ -154,6 +154,11 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				return err
 			}
 			opts.SyslogName = v.(string)
+		case "consul":
+                       if err := checkType(k, reflect.String, v); err != nil {
+                               return err
+                       }
+                       opts.ConsulServerURL = v.(string)
 		}
 	}
 	return nil
