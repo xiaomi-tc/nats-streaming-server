@@ -475,7 +475,7 @@ streaming {
 }
 ```
 
-In the example abve, the configuration assumes no existing NATS Cluster and therefore configure the
+In the example above, the configuration assumes no existing NATS Cluster and therefore configure the
 NATS routes between each node. Should you want to use an existing NATS cluster, do not include the
 "NATS specific configuration" section, instead, add `nats_server_url` in the `streaming` section
 to point to the NATS server you want.
@@ -526,7 +526,9 @@ that the RAFT state can be recovered along with the Streaming state.
 
 To minimize the single point of failure, NATS Streaming server can be run in Fault Tolerance mode. It works by having a group
 of servers with one acting as the active server (accessing the store) and handling all communication with clients, and all others
-acting as standby servers.
+acting as standby servers. 
+
+It is important to note that is not possible to run Nats Stream as Fault Tolerance mode and Clustering mode at the same time.
 
 To start a server in Fault Tolerance (FT) mode, you specify an FT group name.
 
@@ -715,7 +717,7 @@ If no server is handling this channel, no specific error is returned, instead th
 Same goes for message acknowledgements. Only the server handling the subscription on this channel should
 receive those.
 
-However, other client requests (such has connection and subscription requests) are received by all servers.
+However, other client requests (such as connection and subscription requests) are received by all servers.
 For connections, all servers handle them and the client library will receive a response from all servers in the
 cluster, but use the first one that it received.<br>
 For subscriptions, a server receiving the request for a channel that it does not handle will simply ignore
@@ -777,18 +779,18 @@ various general statistics.
 ```
 {
   "cluster_id": "test-cluster",
-  "server_id": "CmvfszzwupAdeX9JZZVItO",
-  "version": "0.11.0",
-  "go": "go1.10.3",
+  "server_id": "rJPYYm1tyjh8gI8jVOXCCD",
+  "version": "0.11.2",
+  "go": "go1.11",
   "state": "STANDALONE",
-  "now": "2018-08-15T11:24:19.505299693-06:00",
-  "start_time": "2018-08-15T11:23:21.593930531-06:00",
-  "uptime": "57s",
+  "now": "2018-10-17T14:14:14.213844-06:00",
+  "start_time": "2018-10-17T14:13:04.977599-06:00",
+  "uptime": "1m9s",
   "clients": 20,
   "subscriptions": 10,
   "channels": 1,
-  "total_msgs": 250518,
-  "total_bytes": 37561190
+  "total_msgs": 374249,
+  "total_bytes": 56120840
 }
 ```
 
@@ -1081,7 +1083,7 @@ The best way to get the NATS Streaming Server is to use one of the pre-built rel
 
 Of course you can build the latest version of the server from the master branch. The master branch will always build and pass tests, but may not work correctly in your environment. You will first need Go installed on your machine (version 1.5+ is required) to build the NATS server.
 
-See also the NATS Streaming Quickstart [tutorial](https://nats.io/doc/streaming/nats-streaming-quickstart/).
+See also the NATS Streaming Quickstart [tutorial](https://nats.io/documentation/streaming/nats-streaming-quickstart/).
 
 ## Building
 
@@ -1103,25 +1105,25 @@ The NATS Streaming Server embeds a NATS Server. Starting the server with no argu
 
 ```
 > ./nats-streaming-server
-[47596] 2018/08/16 13:56:41.699946 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.11.0
-[47596] 2018/08/16 13:56:41.700011 [INF] STREAM: ServerID: 109OXmeLww4bnw0LsuSvwP
-[47596] 2018/08/16 13:56:41.700025 [INF] STREAM: Go version: go1.10.3
-[47596] 2018/08/16 13:56:41.700493 [INF] Starting nats-server version 1.3.0
-[47596] 2018/08/16 13:56:41.700539 [INF] Git commit [not set]
-[47596] 2018/08/16 13:56:41.700731 [INF] Listening for client connections on 0.0.0.0:4222
-[47596] 2018/08/16 13:56:41.700737 [INF] Server is ready
-[47596] 2018/08/16 13:56:41.730457 [INF] STREAM: Recovering the state...
-[47596] 2018/08/16 13:56:41.730492 [INF] STREAM: No recovered state
-[47596] 2018/08/16 13:56:41.984562 [INF] STREAM: Message store is MEMORY
-[47596] 2018/08/16 13:56:41.984685 [INF] STREAM: ---------- Store Limits ----------
-[47596] 2018/08/16 13:56:41.984693 [INF] STREAM: Channels:                  100 *
-[47596] 2018/08/16 13:56:41.984698 [INF] STREAM: --------- Channels Limits --------
-[47596] 2018/08/16 13:56:41.984703 [INF] STREAM:   Subscriptions:          1000 *
-[47596] 2018/08/16 13:56:41.984708 [INF] STREAM:   Messages     :       1000000 *
-[47596] 2018/08/16 13:56:41.984713 [INF] STREAM:   Bytes        :     976.56 MB *
-[47596] 2018/08/16 13:56:41.984717 [INF] STREAM:   Age          :     unlimited *
-[47596] 2018/08/16 13:56:41.984722 [INF] STREAM:   Inactivity   :     unlimited *
-[47596] 2018/08/16 13:56:41.984727 [INF] STREAM: ----------------------------------
+[87332] 2018/10/17 14:11:24.641146 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.11.2
+[87332] 2018/10/17 14:11:24.641216 [INF] STREAM: ServerID: xCVwz8D16K9Xq5VMJuLL8Z
+[87332] 2018/10/17 14:11:24.641219 [INF] STREAM: Go version: go1.11
+[87332] 2018/10/17 14:11:24.641716 [INF] Starting nats-server version 1.3.0
+[87332] 2018/10/17 14:11:24.641724 [INF] Git commit [not set]
+[87332] 2018/10/17 14:11:24.641923 [INF] Listening for client connections on 0.0.0.0:4222
+[87332] 2018/10/17 14:11:24.641929 [INF] Server is ready
+[87332] 2018/10/17 14:11:24.671786 [INF] STREAM: Recovering the state...
+[87332] 2018/10/17 14:11:24.671811 [INF] STREAM: No recovered state
+[87332] 2018/10/17 14:11:24.927248 [INF] STREAM: Message store is MEMORY
+[87332] 2018/10/17 14:11:24.927309 [INF] STREAM: ---------- Store Limits ----------
+[87332] 2018/10/17 14:11:24.927314 [INF] STREAM: Channels:                  100 *
+[87332] 2018/10/17 14:11:24.927317 [INF] STREAM: --------- Channels Limits --------
+[87332] 2018/10/17 14:11:24.927320 [INF] STREAM:   Subscriptions:          1000 *
+[87332] 2018/10/17 14:11:24.927323 [INF] STREAM:   Messages     :       1000000 *
+[87332] 2018/10/17 14:11:24.927326 [INF] STREAM:   Bytes        :     976.56 MB *
+[87332] 2018/10/17 14:11:24.927329 [INF] STREAM:   Age          :     unlimited *
+[87332] 2018/10/17 14:11:24.927333 [INF] STREAM:   Inactivity   :     unlimited *
+[87332] 2018/10/17 14:11:24.927336 [INF] STREAM: ----------------------------------
 ```
 
 The server will be started and listening for client connections on port 4222 (the default) from all available interfaces. The logs will be displayed to stderr as shown above.
@@ -1172,7 +1174,7 @@ sc.exe create nss1 binPath="\"c:\nats-io\nats-streaming\nats-streaming-server.ex
 
 sc.exe create nss2 binPath="\"c:\nats-io\nats-streaming\nats-streaming-server.exe\" --syslog --syslog_name=nss2 -p 4223"
 ```
-By default, wif no logfile is specified, the server will use the system log. The default event source name is `NATS-Streaming-Server`.
+By default, when no logfile is specified, the server will use the system log. The default event source name is `NATS-Streaming-Server`.
 However, you can specify the name you want, which is especially useful when installing more than one service as described above.
 
 Once the service is running, it can be controlled using `sc.exe` or `nats-streaming-server.exe -sl`:
@@ -1688,40 +1690,40 @@ Below is what would be displayed with the above store limits configuration. Noti
 how `foo.bar.>` is indented compared to `foo.>` to show the inheritance.
 
 ```
-[47635] 2018/08/16 13:57:51.074682 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.11.0
-[47635] 2018/08/16 13:57:51.074735 [INF] STREAM: ServerID: HXlseNZwdXvVENS4Ik9yqu
-[47635] 2018/08/16 13:57:51.074749 [INF] STREAM: Go version: go1.10.3
-[47635] 2018/08/16 13:57:51.075208 [INF] Starting nats-server version 1.3.0
-[47635] 2018/08/16 13:57:51.075248 [INF] Git commit [not set]
-[47635] 2018/08/16 13:57:51.075412 [INF] Listening for client connections on 0.0.0.0:4222
-[47635] 2018/08/16 13:57:51.075417 [INF] Server is ready
-[47635] 2018/08/16 13:57:51.102876 [INF] STREAM: Recovering the state...
-[47635] 2018/08/16 13:57:51.102899 [INF] STREAM: No recovered state
-[47635] 2018/08/16 13:57:51.358780 [INF] STREAM: Message store is MEMORY
-[47635] 2018/08/16 13:57:51.359000 [INF] STREAM: ---------- Store Limits ----------
-[47635] 2018/08/16 13:57:51.359012 [INF] STREAM: Channels:                   10
-[47635] 2018/08/16 13:57:51.359018 [INF] STREAM: --------- Channels Limits --------
-[47635] 2018/08/16 13:57:51.359022 [INF] STREAM:   Subscriptions:          1000 *
-[47635] 2018/08/16 13:57:51.359027 [INF] STREAM:   Messages     :         10000
-[47635] 2018/08/16 13:57:51.359032 [INF] STREAM:   Bytes        :      10.00 MB
-[47635] 2018/08/16 13:57:51.359037 [INF] STREAM:   Age          :        1h0m0s
-[47635] 2018/08/16 13:57:51.359042 [INF] STREAM:   Inactivity   :     unlimited *
-[47635] 2018/08/16 13:57:51.359047 [INF] STREAM: -------- List of Channels ---------
-[47635] 2018/08/16 13:57:51.359052 [INF] STREAM: baz
-[47635] 2018/08/16 13:57:51.359057 [INF] STREAM:  |-> Messages             unlimited
-[47635] 2018/08/16 13:57:51.359061 [INF] STREAM:  |-> Bytes                  1.00 MB
-[47635] 2018/08/16 13:57:51.359066 [INF] STREAM:  |-> Age                     2h0m0s
-[47635] 2018/08/16 13:57:51.359071 [INF] STREAM: bozo
-[47635] 2018/08/16 13:57:51.359076 [INF] STREAM: foo.>
-[47635] 2018/08/16 13:57:51.359081 [INF] STREAM:  |-> Messages                   400
-[47635] 2018/08/16 13:57:51.359086 [INF] STREAM:  foo.bar.>
-[47635] 2018/08/16 13:57:51.359090 [INF] STREAM:   |-> Age                    2h0m0s
-[47635] 2018/08/16 13:57:51.359095 [INF] STREAM: temp.>
-[47635] 2018/08/16 13:57:51.359100 [INF] STREAM:  |-> Inactivity              1h0m0s
-[47635] 2018/08/16 13:57:51.359301 [INF] STREAM: bar
-[47635] 2018/08/16 13:57:51.359312 [INF] STREAM:  |-> Messages                    50
-[47635] 2018/08/16 13:57:51.359317 [INF] STREAM:  |-> Bytes                  1.00 KB
-[47635] 2018/08/16 13:57:51.359322 [INF] STREAM: -----------------------------------
+[87394] 2018/10/17 14:12:26.607196 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.11.2
+[87394] 2018/10/17 14:12:26.607248 [INF] STREAM: ServerID: b1KxlSReHGgFAgJVpFyTeP
+[87394] 2018/10/17 14:12:26.607262 [INF] STREAM: Go version: go1.11
+[87394] 2018/10/17 14:12:26.607779 [INF] Starting nats-server version 1.3.0
+[87394] 2018/10/17 14:12:26.607786 [INF] Git commit [not set]
+[87394] 2018/10/17 14:12:26.607968 [INF] Listening for client connections on 0.0.0.0:4222
+[87394] 2018/10/17 14:12:26.607974 [INF] Server is ready
+[87394] 2018/10/17 14:12:26.638266 [INF] STREAM: Recovering the state...
+[87394] 2018/10/17 14:12:26.638291 [INF] STREAM: No recovered state
+[87394] 2018/10/17 14:12:26.892458 [INF] STREAM: Message store is MEMORY
+[87394] 2018/10/17 14:12:26.892645 [INF] STREAM: ---------- Store Limits ----------
+[87394] 2018/10/17 14:12:26.892656 [INF] STREAM: Channels:                   10
+[87394] 2018/10/17 14:12:26.892662 [INF] STREAM: --------- Channels Limits --------
+[87394] 2018/10/17 14:12:26.892667 [INF] STREAM:   Subscriptions:          1000 *
+[87394] 2018/10/17 14:12:26.892672 [INF] STREAM:   Messages     :         10000
+[87394] 2018/10/17 14:12:26.892678 [INF] STREAM:   Bytes        :      10.00 MB
+[87394] 2018/10/17 14:12:26.892683 [INF] STREAM:   Age          :        1h0m0s
+[87394] 2018/10/17 14:12:26.892688 [INF] STREAM:   Inactivity   :     unlimited *
+[87394] 2018/10/17 14:12:26.892693 [INF] STREAM: -------- List of Channels ---------
+[87394] 2018/10/17 14:12:26.892698 [INF] STREAM: baz
+[87394] 2018/10/17 14:12:26.892704 [INF] STREAM:  |-> Messages             unlimited
+[87394] 2018/10/17 14:12:26.892709 [INF] STREAM:  |-> Bytes                  1.00 MB
+[87394] 2018/10/17 14:12:26.892714 [INF] STREAM:  |-> Age                     2h0m0s
+[87394] 2018/10/17 14:12:26.892719 [INF] STREAM: bozo
+[87394] 2018/10/17 14:12:26.892733 [INF] STREAM: foo.>
+[87394] 2018/10/17 14:12:26.892736 [INF] STREAM:  |-> Messages                   400
+[87394] 2018/10/17 14:12:26.892739 [INF] STREAM:  foo.bar.>
+[87394] 2018/10/17 14:12:26.892756 [INF] STREAM:   |-> Age                    2h0m0s
+[87394] 2018/10/17 14:12:26.892761 [INF] STREAM: temp.>
+[87394] 2018/10/17 14:12:26.892766 [INF] STREAM:  |-> Inactivity              1h0m0s
+[87394] 2018/10/17 14:12:26.892771 [INF] STREAM: bar
+[87394] 2018/10/17 14:12:26.892997 [INF] STREAM:  |-> Messages                    50
+[87394] 2018/10/17 14:12:26.893004 [INF] STREAM:  |-> Bytes                  1.00 KB
+[87394] 2018/10/17 14:12:26.893007 [INF] STREAM: -----------------------------------
 ```
 
 
