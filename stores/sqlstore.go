@@ -17,8 +17,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,41 +93,41 @@ const (
 )
 
 var sqlStmts = []string{
-	"SELECT id, tick from StoreLock FOR UPDATE",                                                                                                                    // sqlDBLockSelect
-	"INSERT INTO StoreLock (id, tick) VALUES (?, ?)",                                                                                                               // sqlDBLockInsert
-	"UPDATE StoreLock SET id=?, tick=?",                                                                                                                            // sqlDBLockUpdate
-	"SELECT COUNT(uniquerow) FROM ServerInfo",                                                                                                                      // sqlHasServerInfoRow
-	"UPDATE ServerInfo SET id=?, proto=?, version=? WHERE uniquerow=1",                                                                                             // sqlUpdateServerInfo
-	"INSERT INTO ServerInfo (id, proto, version) VALUES (?, ?, ?)",                                                                                                 // sqlAddServerInfo
-	"INSERT INTO Clients (id, hbinbox, proto) VALUES (?, ?, ?)",                                                                                                    // sqlAddClient
-	"DELETE FROM Clients WHERE id=?",                                                                                                                               // sqlDeleteClient
-	"INSERT INTO Channels (id, name, maxmsgs, maxbytes, maxage) VALUES (?, ?, ?, ?, ?)",                                                                            // sqlAddChannel
-	"INSERT INTO Messages VALUES (?, ?, ?, ?, ?)",                                                                                                                  // sqlStoreMsg
-	"SELECT timestamp, data FROM Messages WHERE id=? AND seq=?",                                                                                                    // sqlLookupMsg
-	"SELECT seq FROM Messages WHERE id=? AND timestamp>=? LIMIT 1",                                                                                                 // sqlGetSequenceFromTimestamp
-	"UPDATE Channels SET maxseq=? WHERE id=?",                                                                                                                      // sqlUpdateChannelMaxSeq
-	"SELECT COUNT(seq), COALESCE(MAX(seq), 0), COALESCE(SUM(size), 0) FROM Messages WHERE id=? AND timestamp<=?",                                                   // sqlGetExpiredMessages
-	"SELECT timestamp FROM Messages WHERE id=? AND seq>=? LIMIT 1",                                                                                                 // sqlGetFirstMsgTimestamp
-	"DELETE FROM Messages WHERE id=? AND seq<=?",                                                                                                                   // sqlDeletedMsgsWithSeqLowerThan
-	"SELECT size FROM Messages WHERE id=? AND seq=?",                                                                                                               // sqlGetSizeOfMessage
-	"DELETE FROM Messages WHERE id=? AND seq=?",                                                                                                                    // sqlDeleteMessage
-	"SELECT COUNT(subid) FROM Subscriptions WHERE id=? AND deleted=FALSE",                                                                                          // sqlCheckMaxSubs
-	"INSERT INTO Subscriptions (id, subid, proto) VALUES (?, ?, ?)",                                                                                                // sqlCreateSub
-	"UPDATE Subscriptions SET proto=? WHERE id=? AND subid=?",                                                                                                      // sqlUpdateSub
-	"UPDATE Subscriptions SET deleted=TRUE WHERE id=? AND subid=?",                                                                                                 // sqlMarkSubscriptionAsDeleted
-	"DELETE FROM Subscriptions WHERE id=? AND subid=?",                                                                                                             // sqlDeleteSubscription
-	"DELETE FROM Subscriptions WHERE id=? AND deleted=TRUE",                                                                                                        // sqlDeleteSubMarkedAsDeleted
-	"DELETE FROM SubsPending WHERE subid=?",                                                                                                                        // sqlDeleteSubPendingMessages
-	"UPDATE Subscriptions SET lastsent=? WHERE id=? AND subid=?",                                                                                                   // sqlSubUpdateLastSent
-	"INSERT INTO SubsPending (subid, `row`, seq) VALUES (?, ?, ?)",                                                                                                 // sqlSubAddPending
-	"INSERT INTO SubsPending (subid, `row`, lastsent, pending, acks) VALUES (?, ?, ?, ?, ?)",                                                                       // sqlSubAddPendingRow
-	"DELETE FROM SubsPending WHERE subid=? AND seq=?",                                                                                                              // sqlSubDeletePending
-	"DELETE FROM SubsPending WHERE subid=? AND `row`=?",                                                                                                            // sqlSubDeletePendingRow
-	"SELECT id, proto, version FROM ServerInfo WHERE uniquerow=1",                                                                                                  // sqlRecoverServerInfo
-	"SELECT id, hbinbox, proto FROM Clients",                                                                                                                       // sqlRecoverClients
-	"SELECT COALESCE(MAX(id), 0) FROM Channels",                                                                                                                    // sqlRecoverMaxChannelID
-	"SELECT COALESCE(MAX(subid), 0) FROM Subscriptions",                                                                                                            // sqlRecoverMaxSubID
-	"SELECT id, name, maxseq FROM Channels WHERE deleted=FALSE",                                                                                                    // sqlRecoverChannelsList
+	"SELECT id, tick from StoreLock FOR UPDATE",                                                                  // sqlDBLockSelect
+	"INSERT INTO StoreLock (id, tick) VALUES (?, ?)",                                                             // sqlDBLockInsert
+	"UPDATE StoreLock SET id=?, tick=?",                                                                          // sqlDBLockUpdate
+	"SELECT COUNT(uniquerow) FROM ServerInfo",                                                                    // sqlHasServerInfoRow
+	"UPDATE ServerInfo SET id=?, proto=?, version=? WHERE uniquerow=1",                                           // sqlUpdateServerInfo
+	"INSERT INTO ServerInfo (id, proto, version) VALUES (?, ?, ?)",                                               // sqlAddServerInfo
+	"INSERT INTO Clients (id, hbinbox, proto) VALUES (?, ?, ?)",                                                  // sqlAddClient
+	"DELETE FROM Clients WHERE id=?",                                                                             // sqlDeleteClient
+	"INSERT INTO Channels (id, name, maxmsgs, maxbytes, maxage) VALUES (?, ?, ?, ?, ?)",                          // sqlAddChannel
+	"INSERT INTO Messages VALUES (?, ?, ?, ?, ?)",                                                                // sqlStoreMsg
+	"SELECT timestamp, data FROM Messages WHERE id=? AND seq=?",                                                  // sqlLookupMsg
+	"SELECT seq FROM Messages WHERE id=? AND timestamp>=? LIMIT 1",                                               // sqlGetSequenceFromTimestamp
+	"UPDATE Channels SET maxseq=? WHERE id=?",                                                                    // sqlUpdateChannelMaxSeq
+	"SELECT COUNT(seq), COALESCE(MAX(seq), 0), COALESCE(SUM(size), 0) FROM Messages WHERE id=? AND timestamp<=?", // sqlGetExpiredMessages
+	"SELECT timestamp FROM Messages WHERE id=? AND seq>=? LIMIT 1",                                               // sqlGetFirstMsgTimestamp
+	"DELETE FROM Messages WHERE id=? AND seq<=?",                                                                 // sqlDeletedMsgsWithSeqLowerThan
+	"SELECT size FROM Messages WHERE id=? AND seq=?",                                                             // sqlGetSizeOfMessage
+	"DELETE FROM Messages WHERE id=? AND seq=?",                                                                  // sqlDeleteMessage
+	"SELECT COUNT(subid) FROM Subscriptions WHERE id=? AND deleted=FALSE",                                        // sqlCheckMaxSubs
+	"INSERT INTO Subscriptions (id, subid, proto) VALUES (?, ?, ?)",                                              // sqlCreateSub
+	"UPDATE Subscriptions SET proto=? WHERE id=? AND subid=?",                                                    // sqlUpdateSub
+	"UPDATE Subscriptions SET deleted=TRUE WHERE id=? AND subid=?",                                               // sqlMarkSubscriptionAsDeleted
+	"DELETE FROM Subscriptions WHERE id=? AND subid=?",                                                           // sqlDeleteSubscription
+	"DELETE FROM Subscriptions WHERE id=? AND deleted=TRUE",                                                      // sqlDeleteSubMarkedAsDeleted
+	"DELETE FROM SubsPending WHERE subid=?",                                                                      // sqlDeleteSubPendingMessages
+	"UPDATE Subscriptions SET lastsent=? WHERE id=? AND subid=?",                                                 // sqlSubUpdateLastSent
+	"INSERT INTO SubsPending (subid, `row`, seq) VALUES (?, ?, ?)",                                               // sqlSubAddPending
+	"INSERT INTO SubsPending (subid, `row`, lastsent, pending, acks) VALUES (?, ?, ?, ?, ?)",                     // sqlSubAddPendingRow
+	"DELETE FROM SubsPending WHERE subid=? AND seq=?",                                                            // sqlSubDeletePending
+	"DELETE FROM SubsPending WHERE subid=? AND `row`=?",                                                          // sqlSubDeletePendingRow
+	"SELECT id, proto, version FROM ServerInfo WHERE uniquerow=1",                                                // sqlRecoverServerInfo
+	"SELECT id, hbinbox, proto FROM Clients",                                                                     // sqlRecoverClients
+	"SELECT COALESCE(MAX(id), 0) FROM Channels",                                                                  // sqlRecoverMaxChannelID
+	"SELECT COALESCE(MAX(subid), 0) FROM Subscriptions",                                                          // sqlRecoverMaxSubID
+	"SELECT id, name, maxseq FROM Channels WHERE deleted=FALSE",                                                  // sqlRecoverChannelsList
 	"SELECT COUNT(seq), COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0), COALESCE(SUM(size), 0), COALESCE(MAX(timestamp), 0) FROM Messages WHERE id=?",                // sqlRecoverChannelMsgs
 	"SELECT lastsent, proto FROM Subscriptions WHERE id=? AND deleted=FALSE",                                                                                       // sqlRecoverChannelSubs
 	"DELETE FROM SubsPending WHERE subid=? AND (seq > 0 AND seq<?)",                                                                                                // sqlRecoverDoPurgeSubsPending
@@ -683,21 +683,18 @@ func initSQLStmtsTable(driver string) {
 	switch driver {
 	case driverPostgres:
 		// Replace ? with $1, $2, etc...
-		reg := regexp.MustCompile(`\?`)
 		for i, stmt := range sqlStmts {
 			n := 0
-			stmt := reg.ReplaceAllStringFunc(stmt, func(string) string {
+			for strings.IndexByte(stmt, '?') != -1 {
 				n++
-				return "$" + strconv.Itoa(n)
-			})
+				param := "$" + strconv.Itoa(n)
+				stmt = strings.Replace(stmt, "?", param, 1)
+			}
 			sqlStmts[i] = stmt
 		}
 		// Replace `row` with row
-		reg = regexp.MustCompile("`row`")
 		for i, stmt := range sqlStmts {
-			stmt := reg.ReplaceAllStringFunc(stmt, func(string) string {
-				return "row"
-			})
+			stmt := strings.Replace(stmt, "`row`", "row", -1)
 			sqlStmts[i] = stmt
 		}
 		// OVER (PARTITION ...) is not supported in older MySQL servers.
@@ -820,7 +817,8 @@ func (s *SQLStore) Recover() (*RecoveredState, error) {
 		var (
 			channelID int64
 			name      string
-			maxseq    uint64
+			maxseq    uint64 // We get that from the Channels table.
+			mmseq     uint64 // This is the max seq found in the Messages table for given channel.
 		)
 		if err := channelRows.Scan(&channelID, &name, &maxseq); err != nil {
 			return nil, err
@@ -829,6 +827,16 @@ func (s *SQLStore) Recover() (*RecoveredState, error) {
 		channelLimits := s.genericStore.getChannelLimits(name)
 
 		msgStore := s.newSQLMsgStore(name, channelID, &channelLimits.MsgStoreLimits)
+
+		// We need to get the last seq from messages table before possibly expiring messages.
+		r = s.preparedStmts[sqlGetLastSeq].QueryRow(channelID)
+		if err := r.Scan(&mmseq); err != nil {
+			return nil, sqlStmtError(sqlGetLastSeq, err)
+		}
+		// If it is more than the one that was updated in the Channel row, then use this one.
+		if mmseq > maxseq {
+			maxseq = mmseq
+		}
 
 		if err := s.applyLimitsOnRecovery(msgStore); err != nil {
 			return nil, err
@@ -849,10 +857,9 @@ func (s *SQLStore) Recover() (*RecoveredState, error) {
 		msgStore.last = last
 		msgStore.totalCount = totalCount
 		msgStore.totalBytes = totalBytes
-		// If all messages have expired, the above should all be 0, however,
-		// the Channel table may contain a maxseq that we should use as starting
-		// point.
-		if msgStore.last == 0 {
+		// Since messages may have been removed due to limits, update first/last
+		// based on known max sequence.
+		if maxseq > msgStore.last {
 			msgStore.first = maxseq + 1
 			msgStore.last = maxseq
 		}
@@ -1948,12 +1955,15 @@ func (ss *SQLSubStore) recoverPendingRow(rows *sql.Rows, sub *spb.SubState, ap *
 		}
 		pendingAcks[seq] = struct{}{}
 	} else {
-		row := &sqlSubsPendingRow{
-			ID:   ss.curRow,
-			msgs: sqlSeqMapPool.Get().(map[uint64]struct{}),
+		var row *sqlSubsPendingRow
+		if ap != nil {
+			row = &sqlSubsPendingRow{
+				ID:   ss.curRow,
+				msgs: sqlSeqMapPool.Get().(map[uint64]struct{}),
+			}
+			ap.lastSent = lastSent
+			ap.prevLastSent = lastSent
 		}
-		ap.lastSent = lastSent
-		ap.prevLastSent = lastSent
 
 		if lastSent > sub.LastSent {
 			sub.LastSent = lastSent
@@ -1961,9 +1971,11 @@ func (ss *SQLSubStore) recoverPendingRow(rows *sql.Rows, sub *spb.SubState, ap *
 		if len(pendingBytes) > 0 {
 			if err := sqlDecodeSeqs(pendingBytes, func(seq uint64) {
 				pendingAcks[seq] = struct{}{}
-				row.msgsRefs++
-				row.msgs[seq] = struct{}{}
-				ap.msgToRow[seq] = row
+				if ap != nil {
+					row.msgsRefs++
+					row.msgs[seq] = struct{}{}
+					ap.msgToRow[seq] = row
+				}
 			}); err != nil {
 				return err
 			}
@@ -1972,15 +1984,17 @@ func (ss *SQLSubStore) recoverPendingRow(rows *sql.Rows, sub *spb.SubState, ap *
 			if err := sqlDecodeSeqs(acksBytes, func(seq uint64) {
 				if _, exists := pendingAcks[seq]; exists {
 					delete(pendingAcks, seq)
-					row.acksRefs++
-					ap.ackToRow[seq] = row
+					if ap != nil {
+						row.acksRefs++
+						ap.ackToRow[seq] = row
 
-					seqRow := ap.msgToRow[seq]
-					if seqRow != nil {
-						delete(ap.msgToRow, seq)
-						seqRow.msgsRefs--
-						if seqRow.msgsRefs == 0 && seqRow.acksRefs == 0 {
-							gcedRows[seqRow.ID] = struct{}{}
+						seqRow := ap.msgToRow[seq]
+						if seqRow != nil {
+							delete(ap.msgToRow, seq)
+							seqRow.msgsRefs--
+							if seqRow.msgsRefs == 0 && seqRow.acksRefs == 0 {
+								gcedRows[seqRow.ID] = struct{}{}
+							}
 						}
 					}
 				}
@@ -2026,14 +2040,13 @@ func (ss *SQLSubStore) flush() error {
 		return err
 	}
 	for subid, ap := range ss.cache.subs {
-		prevLastSent := ap.prevLastSent
-		ap.prevLastSent = ap.lastSent
 		if len(ap.msgs) == 0 && len(ap.acks) == 0 {
 			// Update subscription's lastSent column if it has changed.
-			if ap.lastSent != prevLastSent {
+			if ap.lastSent != ap.prevLastSent {
 				if _, err := tx.Exec(sqlStmts[sqlSubUpdateLastSent], ap.lastSent, ss.channelID, subid); err != nil {
 					return err
 				}
+				ap.prevLastSent = ap.lastSent
 			}
 			// Since there was no pending nor ack for this sub, simply continue
 			// with the next subscription.

@@ -20,6 +20,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1937,6 +1938,7 @@ func TestClusteringLogSnapshotRestoreBatching(t *testing.T) {
 	follower.opts.Clustering.RaftLogging = true
 	follower.opts.CustomLogger = cl
 	follower = runServerWithOpts(t, follower.opts, nil)
+	defer follower.Shutdown()
 	servers = append(servers, follower)
 
 	getLeader(t, 10*time.Second, servers...)
@@ -3419,6 +3421,9 @@ func TestClusteringNodeIDInPeersArray(t *testing.T) {
 }
 
 func TestClusteringUnableToContactPeer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.SkipNow()
+	}
 	cleanupDatastore(t)
 	defer cleanupDatastore(t)
 	cleanupRaftLog(t)
@@ -3751,5 +3756,224 @@ func TestClusteringLogSnapshotRestoreQueueGroupSubNewOnHold(t *testing.T) {
 		case <-time.After(15 * time.Second):
 			t.Fatalf("expected msg %v", i)
 		}
+	}
+}
+
+func TestClusteringStartReceiveNext(t *testing.T) {
+	testCases := []struct {
+		name            string
+		startOpt        stan.SubscriptionOption
+		expectedContent string
+		expectedSeq     uint64
+	}{
+		{
+			"StartAtSequence_1",
+			stan.StartAtSequence(1),
+			"m1",
+			1,
+		},
+		{
+			"StartAtSequence_2",
+			stan.StartAtSequence(2),
+			"m2",
+			2,
+		},
+		{
+			"NewOnly",
+			stan.StartAt(pb.StartPosition_NewOnly),
+			"m2",
+			2,
+		},
+		{
+			"LastReceived",
+			stan.StartWithLastReceived(),
+			"m1",
+			1,
+		},
+		{
+			"AllAvailable",
+			stan.DeliverAllAvailable(),
+			"m1",
+			1,
+		},
+		{
+			"StartAtTime_1",
+			nil, // Will be set in the Run() body
+			"m1",
+			1,
+		},
+		{
+			"StartAtTime_2",
+			nil, // Will be set in the Run() body
+			"m2",
+			2,
+		},
+		{
+			"StartTimeDelta_1",
+			stan.StartAtTimeDelta(10 * time.Second),
+			"m1",
+			1,
+		},
+		{
+			"StartTimeDelta_2",
+			stan.StartAtTimeDelta(100 * time.Millisecond),
+			"m2",
+			2,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanupDatastore(t)
+			defer cleanupDatastore(t)
+			cleanupRaftLog(t)
+			defer cleanupRaftLog(t)
+
+			// For this test, use a central NATS server.
+			ns := natsdTest.RunDefaultServer()
+			defer ns.Shutdown()
+
+			// Configure first server
+			s1sOpts := getTestDefaultOptsForClustering("a", true)
+			s1 := runServerWithOpts(t, s1sOpts, nil)
+			defer s1.Shutdown()
+
+			// Configure second server.
+			s2sOpts := getTestDefaultOptsForClustering("b", false)
+			s2 := runServerWithOpts(t, s2sOpts, nil)
+			defer s2.Shutdown()
+
+			servers := []*StanServer{s1, s2}
+			// Wait for leader to be elected.
+			getLeader(t, 10*time.Second, servers...)
+
+			sc := NewDefaultConnection(t)
+			defer sc.Close()
+			if err := sc.Publish("foo", []byte("m1")); err != nil {
+				t.Fatalf("Error on publish: %v", err)
+			}
+
+			// Set time in the past
+			switch tc.name {
+			case "StartAtTime_1":
+				// Set time in the past
+				tc.startOpt = stan.StartAtTime(time.Unix(0, time.Now().UnixNano()-int64(10*time.Second)))
+			case "StartAtTime_2":
+				time.Sleep(500 * time.Millisecond)
+				tc.startOpt = stan.StartAtTime(time.Now())
+			case "StartTimeDelta_2":
+				time.Sleep(500 * time.Millisecond)
+			default:
+			}
+
+			ch := make(chan *stan.Msg, 2)
+			// Create subscription, it should not get m1
+			if _, err := sc.Subscribe("foo", func(m *stan.Msg) {
+				ch <- m
+			}, tc.startOpt); err != nil {
+				t.Fatalf("Error on subscribe: %v", err)
+			}
+			// Publish m2, now it should get it.
+			if err := sc.Publish("foo", []byte("m2")); err != nil {
+				t.Fatalf("Error on publish: %v", err)
+			}
+			select {
+			case m := <-ch:
+				assertMsg(t, m.MsgProto, []byte(tc.expectedContent), tc.expectedSeq)
+			case <-time.After(2 * time.Second):
+				t.Fatalf("Timeout waiting for message")
+			}
+		})
+	}
+}
+
+type captureNoLeaderLog struct {
+	dummyLogger
+	gotIt bool
+}
+
+func (l *captureNoLeaderLog) Errorf(format string, args ...interface{}) {
+	l.dummyLogger.Lock()
+	trace := fmt.Sprintf(format, args...)
+	if strings.Contains(trace, raft.ErrNotLeader.Error()) {
+		l.gotIt = true
+	}
+	l.dummyLogger.Unlock()
+}
+
+func TestClusteringNotLeaderWhenLeadershipAcquired(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	l := &captureNoLeaderLog{}
+	s1sOpts.CustomLogger = l
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	ch1, ch2 := s1.sendSynchronziationRequest()
+	<-ch1
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	s2.Shutdown()
+
+	time.Sleep(time.Second)
+	close(ch2)
+
+	waitFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		l.Lock()
+		gotIt := l.gotIt
+		l.Unlock()
+		if !gotIt {
+			return fmt.Errorf("Did not get the no leader error")
+		}
+		return nil
+	})
+}
+
+func TestClusteringRaftDefaultTimeouts(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	runningInTests = false
+	defer func() { runningInTests = true }()
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	sOpts := getTestDefaultOptsForClustering("a", true)
+	s := runServerWithOpts(t, sOpts, nil)
+	defer s.Shutdown()
+
+	// Check timeout values
+	s.mu.Lock()
+	hbTimeout := s.opts.Clustering.RaftHeartbeatTimeout
+	electionTimeout := s.opts.Clustering.RaftElectionTimeout
+	leaseTimeout := s.opts.Clustering.RaftLeaseTimeout
+	commitTimeout := s.opts.Clustering.RaftCommitTimeout
+	s.mu.Unlock()
+	if hbTimeout != defaultRaftHBTimeout {
+		t.Fatalf("Expected hb timeout to be %v, got %v", defaultRaftHBTimeout, hbTimeout)
+	}
+	if electionTimeout != defaultRaftElectionTimeout {
+		t.Fatalf("Expected election timeout to be %v, got %v", defaultRaftElectionTimeout, electionTimeout)
+	}
+	if leaseTimeout != defaultRaftLeaseTimeout {
+		t.Fatalf("Expected lease timeout to be %v, got %v", defaultRaftLeaseTimeout, leaseTimeout)
+	}
+	if commitTimeout != defaultRaftCommitTimeout {
+		t.Fatalf("Expected commit timeout to be %v, got %v", defaultRaftCommitTimeout, commitTimeout)
 	}
 }

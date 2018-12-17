@@ -149,6 +149,11 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 			if err := parseCluster(v, opts); err != nil {
 				return err
 			}
+		case "syslog_name":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.SyslogName = v.(string)
 		case "consul":
 			if err := checkType(k, reflect.String, v); err != nil {
 				return err
@@ -257,6 +262,30 @@ func parseCluster(itf interface{}, opts *Options) error {
 				return err
 			}
 			opts.Clustering.RaftLogging = v.(bool)
+		case "raft_heartbeat_timeout":
+			fallthrough
+		case "raft_election_timeout":
+			fallthrough
+		case "raft_lease_timeout":
+			fallthrough
+		case "raft_commit_timeout":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			dur, err := time.ParseDuration(v.(string))
+			if err != nil {
+				return err
+			}
+			switch name {
+			case "raft_heartbeat_timeout":
+				opts.Clustering.RaftHeartbeatTimeout = dur
+			case "raft_election_timeout":
+				opts.Clustering.RaftElectionTimeout = dur
+			case "raft_lease_timeout":
+				opts.Clustering.RaftLeaseTimeout = dur
+			case "raft_commit_timeout":
+				opts.Clustering.RaftCommitTimeout = dur
+			}
 		}
 	}
 	return nil
@@ -575,6 +604,7 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	defSQLOpts := stores.DefaultSQLStoreOptions()
 	fs.BoolVar(&sopts.SQLStoreOpts.NoCaching, "sql_no_caching", defSQLOpts.NoCaching, "Enable/Disable caching")
 	fs.IntVar(&sopts.SQLStoreOpts.MaxOpenConns, "sql_max_open_conns", defSQLOpts.MaxOpenConns, "Max opened connections to the database")
+	fs.StringVar(&sopts.SyslogName, "syslog_name", "", "Syslog Name")
 
 	// 2018-06-13
     sopts.ConsulUtil = new(ConsulUtility)

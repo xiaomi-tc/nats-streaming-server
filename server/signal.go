@@ -19,7 +19,15 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	natsd "github.com/nats-io/gnatsd/server"
 )
+
+func init() {
+	// Set the process name so signal code use this process name
+	// instead of gnatsd.
+	natsd.SetProcessName("nats-streaming-server")
+}
 
 // Signal Handling
 func (s *StanServer) handleSignals() {
@@ -33,7 +41,7 @@ func (s *StanServer) handleSignals() {
 			// registered, so we don't need a "default" in the
 			// switch statement.
 			switch sig {
-			case syscall.SIGKILL, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT:
+			case syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT:
                 //2018-06-13
                 s.log.Noticef("get signal:%v, will UnRegister()", sig)
                 s.opts.ConsulUtil.UnRegister()
@@ -42,7 +50,12 @@ func (s *StanServer) handleSignals() {
 				os.Exit(0)
 			case syscall.SIGUSR1:
 				// File log re-open for rotating file logs.
-				s.natsServer.ReOpenLogFile()
+				s.log.ReopenLogFile()
+			case syscall.SIGHUP:
+				// Ignore for now
+                //2018-06-13
+                s.log.Noticef("get signal:%v, will UnRegister()", sig)
+                s.opts.ConsulUtil.UnRegister()
 			}
 		}
 	}()
