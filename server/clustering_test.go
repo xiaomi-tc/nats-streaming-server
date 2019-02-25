@@ -3977,3 +3977,197 @@ func TestClusteringRaftDefaultTimeouts(t *testing.T) {
 		t.Fatalf("Expected commit timeout to be %v, got %v", defaultRaftCommitTimeout, commitTimeout)
 	}
 }
+
+func TestClusteringWithCryptoStore(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1sOpts.Encrypt = true
+	s1sOpts.EncryptionKey = []byte("key1")
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2sOpts.Encrypt = true
+	s2sOpts.EncryptionKey = []byte("key2")
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	servers := []*StanServer{s1, s2}
+	// Wait for leader to be elected.
+	getLeader(t, 10*time.Second, servers...)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	payload := []byte("this is the content of the message")
+	sc.Publish("foo", payload)
+
+	ch := make(chan pb.MsgProto, 1)
+	sc.Subscribe("foo", func(m *stan.Msg) {
+		ch <- m.MsgProto
+	}, stan.DeliverAllAvailable())
+
+	select {
+	case m := <-ch:
+		assertMsg(t, m, payload, uint64(1))
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Did not get our message")
+	}
+
+	// Now check that raft logs do not contain the payload in plain text
+	s1.raft.Lock()
+	fname1 := s1.raft.store.fileName
+	s1.raft.Unlock()
+
+	s2.raft.Lock()
+	fname2 := s2.raft.store.fileName
+	s2.raft.Unlock()
+
+	sc.Close()
+	s2.Shutdown()
+	s1.Shutdown()
+
+	check := func(t *testing.T, name, fname string) {
+		t.Helper()
+		content, err := ioutil.ReadFile(fname)
+		if err != nil {
+			t.Fatalf("Error reading file %q: %v", fname1, err)
+		}
+		if bytes.Contains(content, payload) {
+			t.Fatalf("Expected raft log of %q to not contain payload in plain text", name)
+		}
+	}
+	check(t, "s1", fname1)
+	check(t, "s2", fname2)
+}
+
+func TestClusteringDeleteChannelLeaksSnapshotSubs(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	maxInactivity := 10 * time.Millisecond
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1sOpts.MaxInactivity = maxInactivity
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	defer s1.Shutdown()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2sOpts.MaxInactivity = maxInactivity
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	defer s2.Shutdown()
+
+	servers := []*StanServer{s1, s2}
+	// Wait for leader to be elected.
+	leader := getLeader(t, 10*time.Second, servers...)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	sc.Publish("foo", []byte("hello"))
+	c := leader.channels.get("foo")
+	time.Sleep(2 * maxInactivity)
+
+	leader.channels.RLock()
+	snapshotSubExists := c.snapshotSub != nil
+	leader.channels.RUnlock()
+	if snapshotSubExists {
+		t.Fatalf("Snapshot subscription for channel still exists")
+	}
+}
+
+func TestClusteringDeadlockOnChannelDelete(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	// For this test, use a central NATS server.
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	maxInactivity := 1000 * time.Millisecond
+
+	// Configure first server
+	s1sOpts := getTestDefaultOptsForClustering("a", true)
+	s1sOpts.MaxInactivity = maxInactivity
+	s1 := runServerWithOpts(t, s1sOpts, nil)
+	// No defer in case deadlock is detected, it would
+	// prevent the print of t.Fatalf()
+
+	// Configure second server.
+	s2sOpts := getTestDefaultOptsForClustering("b", false)
+	s2sOpts.MaxInactivity = maxInactivity
+	s2 := runServerWithOpts(t, s2sOpts, nil)
+	// No defer in case deadlock is detected, it would
+	// prevent the print of t.Fatalf()
+
+	servers := []*StanServer{s1, s2}
+	// Wait for leader to be elected.
+	leader := getLeader(t, 10*time.Second, servers...)
+
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Unable to connect")
+	}
+	defer nc.Close()
+
+	leader.mu.RLock()
+	newSubSubject := leader.info.Subscribe
+	leader.mu.RUnlock()
+
+	req := pb.SubscriptionRequest{
+		ClientID:      "me",
+		AckWaitInSecs: 30,
+		Inbox:         nats.NewInbox(),
+		MaxInFlight:   1,
+	}
+
+	for i := 0; i < 1000; i++ {
+		leader.lookupOrCreateChannel(fmt.Sprintf("foo.%d", i))
+	}
+
+	time.Sleep(990 * time.Millisecond)
+
+	for i := 0; i < 1000; i++ {
+		req.Subject = fmt.Sprintf("foo.%d", i)
+		b, _ := req.Marshal()
+		nc.Publish(newSubSubject, b)
+	}
+
+	ch := make(chan struct{}, 1)
+	go func() {
+		for {
+			if leader.channels.count() != 0 {
+				time.Sleep(15 * time.Millisecond)
+				continue
+			}
+			ch <- struct{}{}
+			return
+		}
+	}()
+	select {
+	case <-ch:
+		s2.Shutdown()
+		s1.Shutdown()
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Deadlock likely!!!")
+	}
+}

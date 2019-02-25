@@ -14,14 +14,17 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/hashicorp/raft"
+	"github.com/nats-io/nats-streaming-server/stores"
 )
 
 func createTestRaftLog(t tLogger, sync bool, trailingLogs int) *raftLog {
@@ -29,7 +32,7 @@ func createTestRaftLog(t tLogger, sync bool, trailingLogs int) *raftLog {
 		stackFatalf(t, "Unable to create raft log directory: %v", err)
 	}
 	fileName := filepath.Join(defaultRaftLog, raftLogFile)
-	store, err := newRaftLog(testLogger, fileName, sync, trailingLogs)
+	store, err := newRaftLog(testLogger, fileName, sync, trailingLogs, false, stores.CryptoCipherAutoSelect, nil)
 	if err != nil {
 		stackFatalf(t, "Error creating store: %v", err)
 	}
@@ -43,11 +46,6 @@ func TestRaftLogDeleteRange(t *testing.T) {
 	// No sync (will check that conn's NoSync value is correct after a recreating the file)
 	store := createTestRaftLog(t, false, 0)
 	defer store.Close()
-
-	// Save reference to bolt connection
-	store.RLock()
-	orgConn := store.conn
-	store.RUnlock()
 
 	// Store in dbConf bucket
 	k1 := []byte("1")
@@ -109,11 +107,6 @@ func TestRaftLogDeleteRange(t *testing.T) {
 		}
 	}
 
-	// Now change the limit to cause re-creation of the bolt DB store.
-	store.Lock()
-	store.simpleDelThresholdLow = 0
-	store.Unlock()
-
 	// Delete just one element
 	if err := store.DeleteRange(6, 6); err != nil {
 		t.Fatalf("Error on delete: %v", err)
@@ -140,17 +133,6 @@ func TestRaftLogDeleteRange(t *testing.T) {
 		if !reflect.DeepEqual(log, logs[i-1]) {
 			t.Fatalf("Unexpected log at index %v: %v", i, log)
 		}
-	}
-	// The store should have been replaced
-	store.RLock()
-	newConn := store.conn
-	noSyncValue := store.conn.NoSync
-	store.RUnlock()
-	if newConn == orgConn {
-		t.Fatalf("Looks like store was not recreated")
-	}
-	if !noSyncValue {
-		t.Fatalf("bolt conn NoSync should be true")
 	}
 
 	// Check close:
@@ -233,4 +215,210 @@ func TestRaftLogEncodeDecodeLogs(t *testing.T) {
 	go decode(&wg, 2*(total/4), 3*(total/4))
 	go decode(&wg, 3*(total/4), total)
 	wg.Wait()
+}
+
+func TestRaftLogWithEncryption(t *testing.T) {
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	store := createTestRaftLog(t, false, 0)
+	defer store.Close()
+	// Plain text log
+	store.StoreLog(&raft.Log{Index: 1, Term: 1, Type: raft.LogCommand, Data: []byte("abcd")})
+	// Log with marker that says AES but content is not encrypted
+	store.StoreLog(&raft.Log{Index: 2, Term: 1, Type: raft.LogCommand, Data: []byte{stores.CryptoCodeAES, 'a', 'b', 'c', 'd'}})
+	store.RLock()
+	fileName := store.fileName
+	store.RUnlock()
+	store.Close()
+
+	// Re-open as encrypted store
+	store, err := newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, []byte("testkey"))
+	if err != nil {
+		t.Fatalf("Error opening store: %v", err)
+	}
+	defer store.Close()
+	// Attempt to get the log, it should be ok
+	rl := &raft.Log{}
+	if err := store.GetLog(uint64(1), rl); err != nil {
+		t.Fatalf("Error getting log: %v", err)
+	}
+	if string(rl.Data) != "abcd" {
+		t.Fatalf("Expected %q, got %q", "abcd", rl.Data)
+	}
+	// Attempt to get the log, it should fail
+	rl = &raft.Log{}
+	if err := store.GetLog(uint64(2), rl); err == nil || !strings.Contains(err.Error(), "trying") {
+		t.Fatalf("Expected error about trying to decrypt data that is not, got %v", err)
+	}
+	store.Close()
+	cleanupRaftLog(t)
+
+	if err := os.MkdirAll(defaultRaftLog, os.ModeDir+os.ModePerm); err != nil {
+		t.Fatalf("Unable to create raft log directory: %v", err)
+	}
+	fileName = filepath.Join(defaultRaftLog, raftLogFile)
+
+	key := []byte("testkey")
+	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, key)
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer store.Close()
+	if string(key) == "testkey" {
+		t.Fatalf("Key should have been erased")
+	}
+
+	expected := []*raft.Log{
+		&raft.Log{
+			Type:  raft.LogCommand,
+			Index: 1,
+			Term:  1,
+			Data:  []byte("msg1"),
+		},
+		&raft.Log{
+			Type:  raft.LogCommand,
+			Index: 2,
+			Term:  1,
+			Data:  []byte("msg2"),
+		},
+		&raft.Log{
+			Type:  raft.LogCommand,
+			Index: 3,
+			Term:  1,
+			Data:  []byte("msg3"),
+		},
+	}
+	if err := store.StoreLogs(expected); err != nil {
+		t.Fatalf("Error storing logs")
+	}
+	for i := 0; i < len(expected); i++ {
+		log := &raft.Log{}
+		if err := store.GetLog(uint64(i+1), log); err != nil {
+			t.Fatalf("Error getting log: %v", err)
+		}
+		if !reflect.DeepEqual(log, expected[i]) {
+			t.Fatalf("Expected %v, got %v", expected[i], log)
+		}
+	}
+	store.Close()
+
+	// Re-open with using env variable
+	os.Unsetenv(stores.CryptoStoreEnvKeyName)
+	defer os.Unsetenv(stores.CryptoStoreEnvKeyName)
+
+	if err := os.Setenv(stores.CryptoStoreEnvKeyName, "testkey"); err != nil {
+		t.Fatalf("Unable to set environment variable: %v", err)
+	}
+	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, nil)
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer store.Close()
+	log := &raft.Log{}
+	if err := store.GetLog(uint64(1), log); err != nil {
+		t.Fatalf("Error getting log: %v", err)
+	}
+	if string(log.Data) != "msg1" {
+		t.Fatalf("Expected %q, got %q", "msg1", log.Data)
+	}
+	store.Close()
+
+	// Ensure that env key override config by providing a wrong key
+	// and notice that we have correct decrypt.
+	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, []byte("wrongkey"))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer store.Close()
+	log = &raft.Log{}
+	if err := store.GetLog(uint64(1), log); err != nil {
+		t.Fatalf("Error getting log: %v", err)
+	}
+	if string(log.Data) != "msg1" {
+		t.Fatalf("Expected %q, got %q", "msg1", log.Data)
+	}
+	store.Close()
+
+	// Now unset env variable and re-open with wrong key
+	os.Unsetenv(stores.CryptoStoreEnvKeyName)
+	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, []byte("wrongkey"))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer store.Close()
+	log = &raft.Log{}
+	if err := store.GetLog(uint64(1), log); err == nil || !strings.Contains(err.Error(), "authentication") {
+		t.Fatalf("Expected error about auth failure, got %v", err)
+	}
+	store.Close()
+
+	// Re-open with encryption but no key, this should fail.
+	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, nil)
+	if err == nil || !strings.Contains(err.Error(), stores.ErrCryptoStoreRequiresKey.Error()) {
+		if store != nil {
+			store.Close()
+		}
+		t.Fatalf("Expected error about missing key, got %v", err)
+	}
+}
+
+func TestRaftLogMultipleCiphers(t *testing.T) {
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	if err := os.MkdirAll(defaultRaftLog, os.ModeDir+os.ModePerm); err != nil {
+		t.Fatalf("Unable to create raft log directory: %v", err)
+	}
+	fileName := filepath.Join(defaultRaftLog, raftLogFile)
+
+	store, err := newRaftLog(testLogger, fileName, false, 0, false, stores.CryptoCipherAutoSelect, nil)
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer store.Close()
+
+	payloads := [][]byte{
+		[]byte("this is a plain text message"),
+		[]byte("this is a message encrypted with AES cipher"),
+		[]byte("this is a message encrypted with CHACHA cipher"),
+	}
+
+	if err := store.StoreLog(&raft.Log{Index: 1, Term: 1, Type: raft.LogCommand, Data: payloads[0]}); err != nil {
+		t.Fatalf("Error storing log: %v", err)
+	}
+	store.Close()
+
+	storeWithEncryption := func(t *testing.T, encryptionCipher string, payloadIdx int) {
+		t.Helper()
+		store, err := newRaftLog(testLogger, fileName, false, 0, true, encryptionCipher, []byte("mykey"))
+		if err != nil {
+			t.Fatalf("Error creating store: %v", err)
+		}
+		defer store.Close()
+
+		if err := store.StoreLog(&raft.Log{Index: uint64(payloadIdx + 1), Term: 1, Type: raft.LogCommand, Data: payloads[payloadIdx]}); err != nil {
+			t.Fatalf("Error storing log: %v", err)
+		}
+		store.Close()
+	}
+	storeWithEncryption(t, stores.CryptoCipherAES, 1)
+	storeWithEncryption(t, stores.CryptoCipherChaChaPoly, 2)
+
+	// Now re-open with any cipher, use the auto-select one.
+	// We should be able to get all 3 messages correctly.
+	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAutoSelect, []byte("mykey"))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer store.Close()
+	for i := 0; i < 3; i++ {
+		l := &raft.Log{}
+		if err := store.GetLog(uint64(i+1), l); err != nil {
+			t.Fatalf("Error getting log: %v", err)
+		}
+		if !bytes.Equal(l.Data, payloads[i]) {
+			t.Fatalf("Expected message %q, got %q", payloads[i], l.Data)
+		}
+	}
 }
