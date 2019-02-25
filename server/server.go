@@ -47,7 +47,7 @@ import (
 // Server defaults.
 const (
 	// VERSION is the current version for the NATS Streaming server.
-	VERSION = "0.11.2"
+	VERSION = "0.12.0"
 
 	DefaultClusterID      = "test-cluster"
 	DefaultDiscoverPrefix = "_STAN.discover"
@@ -118,7 +118,7 @@ const (
 	// To prevent that, when checking if a client exists, in this particular
 	// mode we will possibly wait to be notified when the client has been
 	// registered. This is the default duration for this wait.
-	defaultClientCheckTimeout = 4 * time.Second
+	defaultClientCheckTimeout = time.Second
 
 	// Interval at which server goes through list of subscriptions with
 	// pending sent/ack operations that needs to be replicated.
@@ -956,7 +956,8 @@ func (ss *subStore) Remove(c *channel, sub *subState, unsubscribe bool) {
 			if sub.stalled && qs.stalledSubCount > 0 {
 				qs.stalledSubCount--
 			}
-			now := time.Now().UnixNano()
+			// Set expiration in the past to force redelivery
+			expirationTime := time.Now().UnixNano() - int64(time.Second)
 			// If there are pending messages in this sub, they need to be
 			// transferred to remaining queue subscribers.
 			numQSubs := len(qs.subs)
@@ -985,14 +986,6 @@ func (ss *subStore) Remove(c *channel, sub *subState, unsubscribe bool) {
 				// Update LastSent if applicable
 				if pm.seq > qsub.LastSent {
 					qsub.LastSent = pm.seq
-				}
-				// As of now, members can have different AckWait values.
-				expirationTime := pm.expire
-				// If the member the message is transferred to has a higher AckWait,
-				// keep original expiration time, otherwise check that it is smaller
-				// than the new AckWait.
-				if sub.ackWait > qsub.ackWait && expirationTime-now > 0 {
-					expirationTime = now + int64(qsub.ackWait)
 				}
 				// Store in ackPending.
 				qsub.acksPending[pm.seq] = expirationTime
@@ -1118,6 +1111,9 @@ type Options struct {
 	FTGroupName        string        // Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
 	Partitioning       bool          // Specify if server only accepts messages/subscriptions on channels defined in StoreLimits.
 	SyslogName         string        // Optional name for the syslog (usueful on Windows when running several servers as a service)
+	Encrypt            bool          // Specify if server should encrypt messages payload when storing them
+	EncryptionCipher   string        // Cipher used for encryption. Supported are "AES" and "CHACHA". If none is specified, defaults to AES on platforms with Intel processors, CHACHA otherwise.
+	EncryptionKey      []byte        // Encryption key. The environment NATS_STREAMING_ENCRYPTION_KEY takes precedence and is the preferred way to provide the key.
 	Clustering         ClusteringOptions
 
 	// 2018-06-13
@@ -1186,8 +1182,13 @@ func (s *StanServer) stanClosedHandler(nc *nats.Conn) {
 }
 
 func (s *StanServer) stanErrorHandler(nc *nats.Conn, sub *nats.Subscription, err error) {
-	s.log.Errorf("Asynchronous error on connection %s, subject %s: %s",
-		nc.Opts.Name, sub.Subject, err)
+	if sub != nil {
+		s.log.Errorf("Asynchronous error on connection %s, subject %s: %v",
+			nc.Opts.Name, sub.Subject, err)
+	} else {
+		s.log.Errorf("Asynchronous error on connection %s: %v",
+			nc.Opts.Name, err)
+	}
 }
 
 func (s *StanServer) buildServerURLs() ([]string, error) {
@@ -1478,6 +1479,20 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 		// data that we don't need because they are handled by the actual
 		// raft logs.
 		store = stores.NewRaftStore(store)
+	}
+	if sOpts.Encrypt || len(sOpts.EncryptionKey) > 0 {
+		// In clustering mode, RAFT is using its own logs (not the one above),
+		// so we need to keep the key intact until we call newRaftLog().
+		var key []byte
+		if s.isClustered && len(sOpts.EncryptionKey) > 0 {
+			key = append(key, sOpts.EncryptionKey...)
+		} else {
+			key = sOpts.EncryptionKey
+		}
+		store, err = stores.NewCryptoStore(store, sOpts.EncryptionCipher, key)
+		if err != nil {
+			return nil, err
+		}
 	}
 	s.store = store
 
@@ -2254,7 +2269,7 @@ func (s *StanServer) recoverOneSub(c *channel, recSub *spb.SubState, pendingAcks
 		// Do not recover a queue durable subscriber that still
 		// has ClientID but for which connection was closed (=>!added)
 		if !added && sub.isQueueDurableSubscriber() && !sub.isShadowQueueDurable() {
-			s.log.Noticef("WARN: Not recovering ghost durable queue subscriber: [%s]:[%s] subject=%s inbox=%s", sub.ClientID, sub.QGroup, sub.subject, sub.Inbox)
+			s.log.Warnf("Not recovering ghost durable queue subscriber: [%s]:[%s] subject=%s inbox=%s", sub.ClientID, sub.QGroup, sub.subject, sub.Inbox)
 			c.store.Subs.DeleteSub(sub.ID)
 			return nil
 		}
@@ -2937,11 +2952,15 @@ func (s *StanServer) processClientPublish(m *nats.Msg) {
 		return
 	}
 
+	if s.debug {
+		s.log.Tracef("[Client:%s] Received message from publisher subj=%s guid=%s", pm.ClientID, pm.Subject, pm.Guid)
+	}
+
 	// Check if the client is valid. We do this after the clustered check so
 	// that only the leader performs this check.
 	valid := false
-	if s.partitions != nil || s.isClustered {
-		// In partitioning or clustering it is possible that we get there
+	if s.partitions != nil {
+		// In partitioning mode it is possible that we get there
 		// before the connect request is processed. If so, make sure we wait
 		// for conn request	to be processed first. Check clientCheckTimeout
 		// doc for details.
@@ -3120,13 +3139,11 @@ type byExpire []*pendingMsg
 func (a byExpire) Len() int      { return (len(a)) }
 func (a byExpire) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a byExpire) Less(i, j int) bool {
-	// If expire is 0, it means the server was restarted
-	// and we don't have the expiration time, which will
-	// be set later. Order by sequence instead.
-	if a[i].expire == 0 || a[j].expire == 0 {
-		return a[i].seq < a[j].seq
-	}
-	return a[i].expire < a[j].expire
+	// Always order by sequence since expire could be 0 (in
+	// case of a server restart) but even if it is not, if
+	// expire time happens to be the same, we still want
+	// messages to be ordered by sequence.
+	return a[i].seq < a[j].seq
 }
 
 // Returns an array of pendingMsg ordered by expiration date, unless
@@ -3650,7 +3667,7 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 					if err := f.Error(); err != nil {
 						lastSeq, lerr := c.store.Msgs.LastSequence()
 						if lerr != nil {
-							panic(fmt.Errorf("Error during message replication (%v), unable to get store last sequence: %v", err, lerr))
+							panic(fmt.Errorf("error during message replication (%v), unable to get store last sequence: %v", err, lerr))
 						}
 						c.nextSequence = lastSeq + 1
 					} else {
@@ -3771,13 +3788,13 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 			for c := range storesToFlush {
 				if err := c.store.Msgs.Flush(); err != nil {
 					// TODO: Attempt recovery, notify publishers of error.
-					panic(fmt.Errorf("Unable to flush msg store: %v", err))
+					panic(fmt.Errorf("unable to flush msg store: %v", err))
 				}
 				// Call this here, so messages are sent to subscribers,
 				// which means that msg seq is added to subscription file
 				s.processMsg(c)
 				if err := c.store.Subs.Flush(); err != nil {
-					panic(fmt.Errorf("Unable to flush sub store: %v", err))
+					panic(fmt.Errorf("unable to flush sub store: %v", err))
 				}
 				// Remove entry from map (this is safe in Go)
 				delete(storesToFlush, c)
@@ -3912,7 +3929,10 @@ func (s *StanServer) removeAllNonDurableSubscribers(client *client) {
 	subs := client.subs
 	clientID := client.info.ID
 	client.RUnlock()
-	var storesToFlush map[string]stores.SubStore
+	var (
+		storesToFlush = map[string]stores.SubStore{}
+		channels      = map[string]struct{}{}
+	)
 	for _, sub := range subs {
 		sub.RLock()
 		subject := sub.subject
@@ -3930,11 +3950,9 @@ func (s *StanServer) removeAllNonDurableSubscribers(client *client) {
 		// so we will want to flush the store. In clustering, during replay,
 		// subStore may be nil.
 		if isDurable && subStore != nil {
-			if storesToFlush == nil {
-				storesToFlush = make(map[string]stores.SubStore, 16)
-			}
 			storesToFlush[subject] = subStore
 		}
+		channels[subject] = struct{}{}
 	}
 	if len(storesToFlush) > 0 {
 		for subject, subStore := range storesToFlush {
@@ -3942,6 +3960,9 @@ func (s *StanServer) removeAllNonDurableSubscribers(client *client) {
 				s.log.Errorf("[Client:%s] Error flushing store while removing subscriptions: subject=%s, err=%v", clientID, subject, err)
 			}
 		}
+	}
+	for channel := range channels {
+		s.channels.maybeStartChannelDeleteTimer(channel, nil)
 	}
 }
 

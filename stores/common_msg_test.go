@@ -23,6 +23,30 @@ import (
 	"github.com/nats-io/go-nats-streaming/pb"
 )
 
+func getCryptoOverhead(s MsgStore) uint64 {
+	if cms, ok := s.(*CryptoMsgStore); ok {
+		cms.Lock()
+		overhead := 1 + cms.eds.nonceSize + cms.eds.cryptoOverhead
+		cms.Unlock()
+		return uint64(overhead)
+	}
+	return 0
+}
+
+func getMemMsgStore(ms MsgStore) *MemoryMsgStore {
+	if cms, ok := ms.(*CryptoMsgStore); ok {
+		return cms.MsgStore.(*MemoryMsgStore)
+	}
+	return ms.(*MemoryMsgStore)
+}
+
+func getFileMsgStore(ms MsgStore) *FileMsgStore {
+	if cms, ok := ms.(*CryptoMsgStore); ok {
+		return cms.MsgStore.(*FileMsgStore)
+	}
+	return ms.(*FileMsgStore)
+}
+
 func TestCSBasicMsgStore(t *testing.T) {
 	for _, st := range testStores {
 		st := st
@@ -110,6 +134,7 @@ func TestCSBasicMsgStore(t *testing.T) {
 				// FileStore counts more toward the number of bytes
 				expectedBytes += 2 * (msgRecordOverhead)
 			}
+			expectedBytes += 2 * getCryptoOverhead(ms)
 			if count != 2 || bytes != expectedBytes {
 				t.Fatalf("Unexpected counts: %v, %v vs %v, %v", count, bytes, 2, expectedBytes)
 			}
@@ -148,6 +173,7 @@ func TestCSMsgsState(t *testing.T) {
 			if isFileStore {
 				expectedBytes += msgRecordOverhead
 			}
+			expectedBytes += getCryptoOverhead(cs1.Msgs)
 			if count != 1 || bytes != expectedBytes {
 				t.Fatalf("Unexpected counts: count=%v vs %v - bytes=%v vs %v", count, 1, bytes, expectedBytes)
 			}
@@ -157,6 +183,7 @@ func TestCSMsgsState(t *testing.T) {
 			if isFileStore {
 				expectedBytes += msgRecordOverhead
 			}
+			expectedBytes += getCryptoOverhead(cs2.Msgs)
 			if count != 1 || bytes != expectedBytes {
 				t.Fatalf("Unexpected counts: count=%v vs %v - bytes=%v vs %v", count, 1, bytes, expectedBytes)
 			}
@@ -173,6 +200,8 @@ func TestCSMaxMsgs(t *testing.T) {
 			s := startTest(t, st)
 			defer s.Close()
 
+			oc := storeCreateChannel(t, s, "overhead")
+
 			payload := []byte("hello")
 
 			isFileStore := isStorageBasedOnFile(s)
@@ -187,6 +216,7 @@ func TestCSMaxMsgs(t *testing.T) {
 				if isFileStore {
 					expectedBytes += msgRecordOverhead
 				}
+				expectedBytes += getCryptoOverhead(oc.Msgs)
 				limitCount++
 				if expectedBytes >= stopBytes {
 					break
@@ -241,6 +271,7 @@ func TestCSMaxMsgs(t *testing.T) {
 			if isFileStore {
 				expectedBytes += msgRecordOverhead
 			}
+			expectedBytes += getCryptoOverhead(cs.Msgs)
 
 			count, bytes = msgStoreState(t, cs.Msgs)
 			if count != 1 || bytes != expectedBytes {
@@ -258,6 +289,7 @@ func TestCSMaxMsgs(t *testing.T) {
 				if isFileStore {
 					expectedBytes += msgRecordOverhead
 				}
+				expectedBytes += getCryptoOverhead(cs.Msgs)
 			}
 			limits.MaxMsgs = expectedCount
 			limits.MaxBytes = 0
@@ -286,6 +318,7 @@ func TestCSMaxMsgs(t *testing.T) {
 				if isFileStore {
 					expectedBytes += msgRecordOverhead
 				}
+				expectedBytes += getCryptoOverhead(cs.Msgs)
 				expectedCount++
 				if expectedBytes >= 1000 {
 					break
@@ -399,12 +432,10 @@ func TestCSMaxAge(t *testing.T) {
 				// Verify timer is set
 				isSet := func() bool {
 					var timerSet bool
-					if st.name == TypeMemory {
-						ms := cs.Msgs.(*MemoryMsgStore)
-						ms.RLock()
-						timerSet = ms.ageTimer != nil
-						ms.RUnlock()
-					}
+					ms := getMemMsgStore(cs.Msgs)
+					ms.RLock()
+					timerSet = ms.ageTimer != nil
+					ms.RUnlock()
 					return timerSet
 				}
 				if isSet() {
@@ -507,6 +538,19 @@ func TestCSGetSeqFromStartTime(t *testing.T) {
 			if seq != msgs[count-1].Sequence+1 {
 				t.Fatalf("Expected seq to be %v, got %v", msgs[count-1].Sequence+1, seq)
 			}
+
+			lastMsg := msgs[len(msgs)-1]
+			seq = msgStoreGetSequenceFromTimestamp(t, cs.Msgs, lastMsg.Timestamp)
+			if seq != lastMsg.Sequence {
+				t.Fatalf("Invalid last sequence. Expected %v got %v", lastMsg.Sequence, seq)
+			}
+
+			firstMsg := msgs[0]
+			seq = msgStoreGetSequenceFromTimestamp(t, cs.Msgs, firstMsg.Timestamp)
+			if seq != firstMsg.Sequence {
+				t.Fatalf("Invalid first sequence. Expected %v got %v", firstMsg.Sequence, seq)
+			}
+
 			// Wait for all messages to expire
 			deadline := time.Now().Add(2 * time.Second)
 			var n int
@@ -598,7 +642,7 @@ func TestCSFirstAndLastMsg(t *testing.T) {
 			getInternalFirstAndLastMsg := func() {
 				switch st.name {
 				case TypeMemory:
-					ms := cs.Msgs.(*MemoryMsgStore)
+					ms := getMemMsgStore(cs.Msgs)
 					ms.RLock()
 					firstMsg = ms.msgs[ms.first]
 					lastMsg = ms.msgs[ms.last]
@@ -606,7 +650,7 @@ func TestCSFirstAndLastMsg(t *testing.T) {
 				case TypeFile:
 					fallthrough
 				case TypeRaft:
-					ms := cs.Msgs.(*FileMsgStore)
+					ms := getFileMsgStore(cs.Msgs)
 					ms.RLock()
 					firstMsg = ms.firstMsg
 					lastMsg = ms.lastMsg

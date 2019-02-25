@@ -154,6 +154,22 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				return err
 			}
 			opts.SyslogName = v.(string)
+		case "encrypt":
+			if err := checkType(k, reflect.Bool, v); err != nil {
+				return err
+			}
+			opts.Encrypt = v.(bool)
+		case "encryption_cipher":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.EncryptionCipher = v.(string)
+		case "encryption_key":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.Encrypt = true
+			opts.EncryptionKey = []byte(v.(string))
 		case "consul":
 			if err := checkType(k, reflect.String, v); err != nil {
 				return err
@@ -533,6 +549,7 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 		stanConfigFile string
 		natsConfigFile string
 		clusterPeers   string
+		encryptionKey  string
 	)
 
 	fs.StringVar(&sopts.ID, "cluster_id", DefaultClusterID, "stan.ID")
@@ -605,10 +622,13 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.BoolVar(&sopts.SQLStoreOpts.NoCaching, "sql_no_caching", defSQLOpts.NoCaching, "Enable/Disable caching")
 	fs.IntVar(&sopts.SQLStoreOpts.MaxOpenConns, "sql_max_open_conns", defSQLOpts.MaxOpenConns, "Max opened connections to the database")
 	fs.StringVar(&sopts.SyslogName, "syslog_name", "", "Syslog Name")
+	fs.BoolVar(&sopts.Encrypt, "encrypt", false, "Specify if server should use encryption at rest")
+	fs.StringVar(&sopts.EncryptionCipher, "encryption_cipher", stores.CryptoCipherAutoSelect, "Encryption cipher. Supported are AES and CHACHA (default is AES)")
+	fs.StringVar(&encryptionKey, "encryption_key", "", "Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead")
 
 	// 2018-06-13
-    sopts.ConsulUtil = new(ConsulUtility)
-    fs.StringVar(&sopts.ConsulServerURL, "consul", "", "consul server address,like: 127.0.0.1:8500")
+	sopts.ConsulUtil = new(ConsulUtility)
+	fs.StringVar(&sopts.ConsulServerURL, "consul", "", "consul server address,like: 127.0.0.1:8500")
 
 	// First, we need to call NATS's ConfigureOptions() with above flag set.
 	// It will be augmented with NATS specific flags and call fs.Parse(args) for us.
@@ -627,6 +647,11 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 				sopts.Clustering.Peers = append(sopts.Clustering.Peers, p)
 			}
 		}
+	}
+
+	if encryptionKey != "" {
+		sopts.Encrypt = true
+		sopts.EncryptionKey = []byte(encryptionKey)
 	}
 
 	// If both nats and streaming configuration files are used, then
