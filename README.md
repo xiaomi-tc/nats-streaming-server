@@ -807,7 +807,6 @@ nats-streaming-server -m 8222
 you should see that the NATS Streaming server starts with the HTTP monitoring port enabled:
 
 ```
-[53359] 2017/12/18 17:44:31.592661 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.7.0
 (...)
 [53359] 2017/12/18 17:44:31.594407 [INF] Starting http monitor on 0.0.0.0:8222
 [53359] 2017/12/18 17:44:31.594462 [INF] Listening for client connections on 0.0.0.0:4222
@@ -826,13 +825,13 @@ various general statistics.
 ```
 {
   "cluster_id": "test-cluster",
-  "server_id": "lB3XQKMRgASd516uNpxzkn",
-  "version": "0.12.0",
-  "go": "go1.11.5",
+  "server_id": "8AjZq57k4JY7cfKEvuZ8iF",
+  "version": "0.14.0",
+  "go": "go1.11.9",
   "state": "STANDALONE",
-  "now": "2019-02-07T11:50:28.671609-07:00",
-  "start_time": "2019-02-07T11:50:23.21274-07:00",
-  "uptime": "5s",
+  "now": "2019-04-16T09:57:03.02621-06:00",
+  "start_time": "2019-04-16T09:56:46.216394-06:00",
+  "uptime": "16s",
   "clients": 0,
   "subscriptions": 0,
   "channels": 0,
@@ -841,6 +840,28 @@ various general statistics.
 }
 ```
 
+In clustering mode, there is an additional field that indicates the RAFT role of the given node.
+Here is an example:
+```
+{
+  "cluster_id": "test-cluster",
+  "server_id": "4nJktiU7xCHkAWiinn3QeD",
+  "version": "0.14.0",
+  "go": "go1.11.9",
+  "state": "CLUSTERED",
+  "role": "Leader",
+  "now": "2019-04-16T12:47:07.46862-06:00",
+  "start_time": "2019-04-16T12:46:51.857555-06:00",
+  "uptime": "15s",
+  "clients": 0,
+  "subscriptions": 0,
+  "channels": 0,
+  "total_msgs": 0,
+  "total_bytes": 0
+}
+```
+The possible values are: `Leader`, `Follower` or `Candidate`.
+
 #### /storez
 
 The endpoint [http://localhost:8222/streaming/storez](http://localhost:8222/streaming/storez) reports
@@ -848,15 +869,16 @@ information about the store.
 ```
 {
   "cluster_id": "test-cluster",
-  "server_id": "J3Odi0wXYKWKFWz5D5uhH9",
-  "now": "2017-06-07T14:45:46.738570607+02:00",
+  "server_id": "8AjZq57k4JY7cfKEvuZ8iF",
+  "now": "2019-04-16T09:57:32.857406-06:00",
   "type": "MEMORY",
   "limits": {
     "max_channels": 100,
     "max_msgs": 1000000,
     "max_bytes": 1024000000,
     "max_age": 0,
-    "max_subscriptions": 1000
+    "max_subscriptions": 1000,
+    "max_inactivity": 0
   },
   "total_msgs": 130691,
   "total_bytes": 19587140
@@ -1152,25 +1174,26 @@ The NATS Streaming Server embeds a NATS Server. Starting the server with no argu
 
 ```
 > ./nats-streaming-server
-[45928] 2019/02/07 11:50:46.263911 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.12.0
-[45928] 2019/02/07 11:50:46.263970 [INF] STREAM: ServerID: eu6MEe09uGiIOLBPbPNvCN
-[45928] 2019/02/07 11:50:46.263973 [INF] STREAM: Go version: go1.11.5
-[45928] 2019/02/07 11:50:46.264557 [INF] Starting nats-server version 1.3.0
-[45928] 2019/02/07 11:50:46.264566 [INF] Git commit [not set]
-[45928] 2019/02/07 11:50:46.264766 [INF] Listening for client connections on 0.0.0.0:4222
-[45928] 2019/02/07 11:50:46.264772 [INF] Server is ready
-[45928] 2019/02/07 11:50:46.293547 [INF] STREAM: Recovering the state...
-[45928] 2019/02/07 11:50:46.293569 [INF] STREAM: No recovered state
-[45928] 2019/02/07 11:50:46.549422 [INF] STREAM: Message store is MEMORY
-[45928] 2019/02/07 11:50:46.549504 [INF] STREAM: ---------- Store Limits ----------
-[45928] 2019/02/07 11:50:46.549512 [INF] STREAM: Channels:                  100 *
-[45928] 2019/02/07 11:50:46.549518 [INF] STREAM: --------- Channels Limits --------
-[45928] 2019/02/07 11:50:46.549523 [INF] STREAM:   Subscriptions:          1000 *
-[45928] 2019/02/07 11:50:46.549528 [INF] STREAM:   Messages     :       1000000 *
-[45928] 2019/02/07 11:50:46.549534 [INF] STREAM:   Bytes        :     976.56 MB *
-[45928] 2019/02/07 11:50:46.549539 [INF] STREAM:   Age          :     unlimited *
-[45928] 2019/02/07 11:50:46.549544 [INF] STREAM:   Inactivity   :     unlimited *
-[45928] 2019/02/07 11:50:46.549549 [INF] STREAM: ----------------------------------
+[75895] 2019/04/16 09:56:46.216416 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.14.0
+[75895] 2019/04/16 09:56:46.216496 [INF] STREAM: ServerID: 8AjZq57k4JY7cfKEvuZ8iF
+[75895] 2019/04/16 09:56:46.216499 [INF] STREAM: Go version: go1.11.9
+[75895] 2019/04/16 09:56:46.216501 [INF] STREAM: Git commit: [not set]
+[75895] 2019/04/16 09:56:46.216963 [INF] Starting nats-server version 1.4.1
+[75895] 2019/04/16 09:56:46.216969 [INF] Git commit [not set]
+[75895] 2019/04/16 09:56:46.217263 [INF] Listening for client connections on 0.0.0.0:4222
+[75895] 2019/04/16 09:56:46.217267 [INF] Server is ready
+[75895] 2019/04/16 09:56:46.249214 [INF] STREAM: Recovering the state...
+[75895] 2019/04/16 09:56:46.249233 [INF] STREAM: No recovered state
+[75895] 2019/04/16 09:56:46.504767 [INF] STREAM: Message store is MEMORY
+[75895] 2019/04/16 09:56:46.504818 [INF] STREAM: ---------- Store Limits ----------
+[75895] 2019/04/16 09:56:46.504824 [INF] STREAM: Channels:                  100 *
+[75895] 2019/04/16 09:56:46.504828 [INF] STREAM: --------- Channels Limits --------
+[75895] 2019/04/16 09:56:46.504832 [INF] STREAM:   Subscriptions:          1000 *
+[75895] 2019/04/16 09:56:46.504835 [INF] STREAM:   Messages     :       1000000 *
+[75895] 2019/04/16 09:56:46.504839 [INF] STREAM:   Bytes        :     976.56 MB *
+[75895] 2019/04/16 09:56:46.504843 [INF] STREAM:   Age          :     unlimited *
+[75895] 2019/04/16 09:56:46.504846 [INF] STREAM:   Inactivity   :     unlimited *
+[75895] 2019/04/16 09:56:46.504851 [INF] STREAM: ----------------------------------
 ```
 
 The server will be started and listening for client connections on port 4222 (the default) from all available interfaces. The logs will be displayed to stderr as shown above.
@@ -1391,7 +1414,7 @@ Streaming Server Clustering Options:
     --clustered <bool>                   Run the server in a clustered configuration (default: false)
     --cluster_node_id <string>           ID of the node within the cluster if there is no stored ID (default: random UUID)
     --cluster_bootstrap <bool>           Bootstrap the cluster if there is no existing state by electing self as leader (default: false)
-    --cluster_peers <string>             List of cluster peer node IDs to bootstrap cluster state.
+    --cluster_peers <string, ...>        Comma separated list of cluster peer node IDs to bootstrap cluster state
     --cluster_log_path <string>          Directory to store log replication data
     --cluster_log_cache_size <int>       Number of log entries to cache in memory to reduce disk IO (default: 512)
     --cluster_log_snapshots <int>        Number of log snapshots to retain (default: 2)
@@ -1621,6 +1644,10 @@ Cluster Configuration:
 | trailing_logs | Number of log entries to leave after a snapshot and compaction | Number >= 0 | `trailing_logs: 256` |
 | sync | Do a file sync after every write to the replication log and message store | `true` or `false` | `sync: true` |
 | raft_logging | Enable logging from the Raft library (disabled by default) | `true` or `false` | `raft_logging: true` |
+| raft_heartbeat_timeout | Specifies the time in follower state without a leader before attempting an election | Duration | `raft_heartbeat_timeout: "2s"` |
+| raft_election_timeout | Specifies the time in candidate state without a leader before attempting an election | Duration | `raft_election_timeout: "2s"` |
+| raft_lease_timeout | Specifies how long a leader waits without being able to contact a quorum of nodes before stepping down as leader | Duration | `raft_lease_timeout: "1s"` |
+| raft_commit_timeout | Specifies the time without an Apply() operation before sending an heartbeat to ensure timely commit. Due to random staggering, may be delayed as much as 2x this value | Duration | `raft_commit_timeout: "100ms"` |
 
 SQL Options Configuration:
 
@@ -1743,40 +1770,41 @@ Below is what would be displayed with the above store limits configuration. Noti
 how `foo.bar.>` is indented compared to `foo.>` to show the inheritance.
 
 ```
-[45997] 2019/02/07 11:51:47.228573 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.12.0
-[45997] 2019/02/07 11:51:47.228624 [INF] STREAM: ServerID: u0jNuUBszT1yFDwvLjp8DM
-[45997] 2019/02/07 11:51:47.228627 [INF] STREAM: Go version: go1.11.5
-[45997] 2019/02/07 11:51:47.229207 [INF] Starting nats-server version 1.3.0
-[45997] 2019/02/07 11:51:47.229215 [INF] Git commit [not set]
-[45997] 2019/02/07 11:51:47.229435 [INF] Listening for client connections on 0.0.0.0:4222
-[45997] 2019/02/07 11:51:47.229441 [INF] Server is ready
-[45997] 2019/02/07 11:51:47.258258 [INF] STREAM: Recovering the state...
-[45997] 2019/02/07 11:51:47.258283 [INF] STREAM: No recovered state
-[45997] 2019/02/07 11:51:47.514041 [INF] STREAM: Message store is MEMORY
-[45997] 2019/02/07 11:51:47.514214 [INF] STREAM: ---------- Store Limits ----------
-[45997] 2019/02/07 11:51:47.514226 [INF] STREAM: Channels:                   10
-[45997] 2019/02/07 11:51:47.514232 [INF] STREAM: --------- Channels Limits --------
-[45997] 2019/02/07 11:51:47.514237 [INF] STREAM:   Subscriptions:          1000 *
-[45997] 2019/02/07 11:51:47.514243 [INF] STREAM:   Messages     :         10000
-[45997] 2019/02/07 11:51:47.514248 [INF] STREAM:   Bytes        :      10.00 MB
-[45997] 2019/02/07 11:51:47.514253 [INF] STREAM:   Age          :        1h0m0s
-[45997] 2019/02/07 11:51:47.514259 [INF] STREAM:   Inactivity   :     unlimited *
-[45997] 2019/02/07 11:51:47.514264 [INF] STREAM: -------- List of Channels ---------
-[45997] 2019/02/07 11:51:47.514269 [INF] STREAM: baz
-[45997] 2019/02/07 11:51:47.514275 [INF] STREAM:  |-> Messages             unlimited
-[45997] 2019/02/07 11:51:47.514280 [INF] STREAM:  |-> Bytes                  1.00 MB
-[45997] 2019/02/07 11:51:47.514285 [INF] STREAM:  |-> Age                     2h0m0s
-[45997] 2019/02/07 11:51:47.514291 [INF] STREAM: bozo
-[45997] 2019/02/07 11:51:47.514296 [INF] STREAM: foo.>
-[45997] 2019/02/07 11:51:47.514301 [INF] STREAM:  |-> Messages                   400
-[45997] 2019/02/07 11:51:47.514501 [INF] STREAM:  foo.bar.>
-[45997] 2019/02/07 11:51:47.514513 [INF] STREAM:   |-> Age                    2h0m0s
-[45997] 2019/02/07 11:51:47.514519 [INF] STREAM: temp.>
-[45997] 2019/02/07 11:51:47.514524 [INF] STREAM:  |-> Inactivity              1h0m0s
-[45997] 2019/02/07 11:51:47.514530 [INF] STREAM: bar
-[45997] 2019/02/07 11:51:47.514535 [INF] STREAM:  |-> Messages                    50
-[45997] 2019/02/07 11:51:47.514540 [INF] STREAM:  |-> Bytes                  1.00 KB
-[45997] 2019/02/07 11:51:47.514546 [INF] STREAM: -----------------------------------
+[INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.14.0
+[INF] STREAM: ServerID: Ee5S1bSAF5USweh93sH11n
+[INF] STREAM: Go version: go1.11.9
+[INF] STREAM: Git commit: [not set]
+[INF] Starting nats-server version 1.4.1
+[INF] Git commit [not set]
+[INF] Listening for client connections on 0.0.0.0:4222
+[INF] Server is ready
+[INF] STREAM: Recovering the state...
+[INF] STREAM: No recovered state
+[INF] STREAM: Message store is MEMORY
+[INF] STREAM: ---------- Store Limits ----------
+[INF] STREAM: Channels:                   10
+[INF] STREAM: --------- Channels Limits --------
+[INF] STREAM:   Subscriptions:          1000 *
+[INF] STREAM:   Messages     :         10000
+[INF] STREAM:   Bytes        :      10.00 MB
+[INF] STREAM:   Age          :        1h0m0s
+[INF] STREAM:   Inactivity   :     unlimited *
+[INF] STREAM: -------- List of Channels ---------
+[INF] STREAM: baz
+[INF] STREAM:  |-> Messages             unlimited
+[INF] STREAM:  |-> Bytes                  1.00 MB
+[INF] STREAM:  |-> Age                     2h0m0s
+[INF] STREAM: bozo
+[INF] STREAM: temp.>
+[INF] STREAM:  |-> Inactivity              1h0m0s
+[INF] STREAM: foo.>
+[INF] STREAM:  |-> Messages                   400
+[INF] STREAM:  foo.bar.>
+[INF] STREAM:   |-> Age                    2h0m0s
+[INF] STREAM: bar
+[INF] STREAM:  |-> Messages                    50
+[INF] STREAM:  |-> Bytes                  1.00 KB
+[INF] STREAM: -----------------------------------
 ```
 
 

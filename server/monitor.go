@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	gnatsd "github.com/nats-io/gnatsd/server"
@@ -46,6 +47,7 @@ type Serverz struct {
 	Version       string    `json:"version"`
 	GoVersion     string    `json:"go"`
 	State         string    `json:"state"`
+	Role          string    `json:"role,omitempty"`
 	Now           time.Time `json:"now"`
 	Start         time.Time `json:"start_time"`
 	Uptime        string    `json:"uptime"`
@@ -183,8 +185,12 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Error getting information about channels state: %v", err), http.StatusInternalServerError)
 		return
 	}
+	var role string
 	s.mu.RLock()
 	state := s.state
+	if s.raft != nil {
+		role = s.raft.State().String()
+	}
 	s.mu.RUnlock()
 	s.monMu.RLock()
 	numSubs := s.numSubs
@@ -213,6 +219,7 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		Version:       VERSION,
 		GoVersion:     runtime.Version(),
 		State:         state.String(),
+		Role:          role,
 		Now:           now,
 		Start:         s.startTime,
 		Uptime:        myUptime(now.Sub(s.startTime)),
@@ -455,7 +462,7 @@ func (s *StanServer) handleChannelsz(w http.ResponseWriter, r *http.Request) {
 			carr = carr[minoff:maxoff]
 			for _, cz := range carr {
 				cs := channels[cz.Name]
-				if err := updateChannelz(cz, cs, subsOption); err != nil {
+				if err := s.updateChannelz(cz, cs, subsOption); err != nil {
 					http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", channelName, err), http.StatusInternalServerError)
 					return
 				}
@@ -483,14 +490,14 @@ func (s *StanServer) handleOneChannel(w http.ResponseWriter, r *http.Request, na
 		return
 	}
 	channelz := &Channelz{Name: name}
-	if err := updateChannelz(channelz, cs, subsOption); err != nil {
+	if err := s.updateChannelz(channelz, cs, subsOption); err != nil {
 		http.Error(w, fmt.Sprintf("Error getting information about channel %q: %v", name, err), http.StatusInternalServerError)
 		return
 	}
 	s.sendResponse(w, r, channelz)
 }
 
-func updateChannelz(cz *Channelz, c *channel, subsOption int) error {
+func (s *StanServer) updateChannelz(cz *Channelz, c *channel, subsOption int) error {
 	msgs, bytes, err := c.store.Msgs.State()
 	if err != nil {
 		return fmt.Errorf("unable to get message state: %v", err)
@@ -501,6 +508,12 @@ func updateChannelz(cz *Channelz, c *channel, subsOption int) error {
 	}
 	cz.Msgs = msgs
 	cz.Bytes = bytes
+	if fseq == 0 && lseq == 0 && s.isClustered {
+		fseq = atomic.LoadUint64(&c.firstSeq)
+		if fseq > 1 {
+			lseq = fseq - 1
+		}
+	}
 	cz.FirstSeq = fseq
 	cz.LastSeq = lseq
 	if subsOption == 1 {

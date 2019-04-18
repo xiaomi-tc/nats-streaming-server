@@ -472,6 +472,11 @@ func (r *raftFSM) Apply(l *raft.Log) interface{} {
 			// This is a batch for a given channel, so lookup channel once.
 			if c == nil {
 				c, err = s.lookupOrCreateChannel(msg.Subject)
+				// That should not be the case, but if it happens,
+				// just bail out.
+				if err == ErrChanDelInProgress {
+					return nil
+				}
 			}
 			if err == nil {
 				_, err = c.store.Msgs.Store(msg)
@@ -490,7 +495,7 @@ func (r *raftFSM) Apply(l *raft.Log) interface{} {
 		return s.closeClient(op.ClientDisconnect.ClientID)
 	case spb.RaftOperation_Subscribe:
 		// Subscription replication.
-		sub, err := s.processSub(nil, op.Sub.Request, op.Sub.AckInbox)
+		sub, err := s.processSub(nil, op.Sub.Request, op.Sub.AckInbox, op.Sub.ID)
 		return &replicatedSub{sub: sub, err: err}
 	case spb.RaftOperation_RemoveSubscription:
 		fallthrough
