@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	natsd "github.com/nats-io/gnatsd/server"
-	natsdTest "github.com/nats-io/gnatsd/test"
+	natsd "github.com/nats-io/nats-server/v2/server"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 )
 
 func TestSignalIgnoreUnknown(t *testing.T) {
@@ -59,7 +59,7 @@ func TestSignalToReOpenLogFile(t *testing.T) {
 		sopts := GetDefaultOptions()
 		sopts.HandleSignals = true
 		nopts := &natsd.Options{
-			Host:    "localhost",
+			Host:    "127.0.0.1",
 			Port:    -1,
 			NoSigs:  true,
 			LogFile: logFile,
@@ -131,7 +131,7 @@ func (sc *stderrCatcher) Write(p []byte) (n int, err error) {
 }
 
 func TestSignalTrapsSIGTERM(t *testing.T) {
-	// This test requires that the
+	// This test requires that the server be installed.
 	cmd := exec.Command("nats-streaming-server")
 	sc := &stderrCatcher{}
 	cmd.Stderr = sc
@@ -139,12 +139,12 @@ func TestSignalTrapsSIGTERM(t *testing.T) {
 	// Wait for it to print some startup trace
 	waitFor(t, 2*time.Second, 15*time.Millisecond, func() error {
 		sc.Lock()
-		ready := bytes.Contains(sc.b, []byte("STREAM: ------------------"))
+		ready := bytes.Contains(sc.b, []byte(streamingReadyLog))
 		sc.Unlock()
 		if ready {
 			return nil
 		}
-		return fmt.Errorf("process not started yet")
+		return fmt.Errorf("process not started yet, make sure you `go install` first!")
 	})
 	syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
 	cmd.Wait()
@@ -153,5 +153,58 @@ func TestSignalTrapsSIGTERM(t *testing.T) {
 	sc.Unlock()
 	if !gotIt {
 		t.Fatalf("Did not get the Shutting down trace (make sure you did a `go install` prior to running the test")
+	}
+}
+
+func createConfFile(t *testing.T, content []byte) string {
+	t.Helper()
+	conf, err := ioutil.TempFile("", "")
+	if err != nil {
+		t.Fatalf("Error creating conf file: %v", err)
+	}
+	fName := conf.Name()
+	conf.Close()
+	if err := ioutil.WriteFile(fName, content, 0666); err != nil {
+		os.Remove(fName)
+		t.Fatalf("Error writing conf file: %v", err)
+	}
+	return fName
+}
+
+func changeCurrentConfigContentWithNewContent(t *testing.T, curConfig string, content []byte) {
+	t.Helper()
+	if err := ioutil.WriteFile(curConfig, content, 0666); err != nil {
+		t.Fatalf("Error writing config: %v", err)
+	}
+}
+
+func TestSignalReload(t *testing.T) {
+	conf := createConfFile(t, []byte(`debug: false`))
+	defer os.Remove(conf)
+	// This test requires that the server be installed.
+	cmd := exec.Command("nats-streaming-server", "-c", conf)
+	sc := &stderrCatcher{}
+	cmd.Stderr = sc
+	cmd.Start()
+	// Wait for it to print some startup trace
+	waitFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		sc.Lock()
+		ready := bytes.Contains(sc.b, []byte(streamingReadyLog))
+		sc.Unlock()
+		if ready {
+			return nil
+		}
+		return fmt.Errorf("process not started yet, make sure you `go install` first!")
+	})
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(`debug: true`))
+	syscall.Kill(cmd.Process.Pid, syscall.SIGHUP)
+	time.Sleep(500 * time.Millisecond)
+	syscall.Kill(cmd.Process.Pid, syscall.SIGINT)
+	cmd.Wait()
+	sc.Lock()
+	gotIt := bytes.Contains(sc.b, []byte("Reloaded: debug = true"))
+	sc.Unlock()
+	if !gotIt {
+		t.Fatalf("Did not get the Reload trace (make sure you did a `go install` prior to running the test")
 	}
 }

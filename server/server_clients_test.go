@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func TestClientIDIsValid(t *testing.T) {
@@ -345,7 +345,7 @@ func TestClientsWithDupCID(t *testing.T) {
 
 	connect := func(cid string, shouldFail bool) (stan.Conn, time.Duration, error) {
 		start := time.Now()
-		c, err := stan.Connect(clusterName, cid, stan.ConnectWait(3*s.dupCIDTimeout))
+		c, err := stan.Connect(clusterName, cid, stan.NatsURL(nats.DefaultURL), stan.ConnectWait(3*s.dupCIDTimeout))
 		duration := time.Since(start)
 		if shouldFail {
 			if c != nil {
@@ -401,7 +401,7 @@ func TestClientsWithDupCID(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 	defer newConn.Close()
-	if duration >= dupTimeoutMin {
+	if duration >= dupTimeoutMax {
 		t.Fatalf("Connect expected to be fast, took %v", duration)
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,11 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/test"
 	"github.com/nats-io/nuid"
+	"github.com/nats-io/stan.go/pb"
 )
 
 var testDefaultStoreLimits = StoreLimits{
@@ -63,10 +63,10 @@ type testStore struct {
 var (
 	testLogger logger.Logger
 	testStores = []*testStore{
-		&testStore{TypeMemory, false},
-		&testStore{TypeFile, true},
-		&testStore{TypeSQL, true},
-		&testStore{TypeRaft, false},
+		{TypeMemory, false},
+		{TypeFile, true},
+		{TypeSQL, true},
+		{TypeRaft, false},
 	}
 	testTimestampMu   sync.Mutex
 	testLastTimestamp int64
@@ -100,6 +100,8 @@ func stackFatalf(t tLogger, f string, args ...interface{}) {
 	}
 
 	t.Fatalf("%s", strings.Join(lines, "\n"))
+	// For staticcheck SA0511...
+	panic("unreachable code")
 }
 
 func msgStoreLookup(t tLogger, ms MsgStore, seq uint64) *pb.MsgProto {
@@ -375,6 +377,7 @@ func TestMain(m *testing.M) {
 	var encryptionKey string
 
 	flag.BoolVar(&testFSDisableBufferWriters, "fs_no_buffer", false, "Disable use of buffer writers")
+	flag.BoolVar(&testFSDisableReadBuffer, "fs_no_read_buffer", false, "Disable use of read buffer")
 	flag.BoolVar(&testFSSetFDsLimit, "fs_set_fds_limit", false, "Set some FDs limit")
 	flag.BoolVar(&doSQL, "sql", true, "Set this to false if you don't want SQL to be tested")
 	test.AddSQLFlags(flag.CommandLine, &testSQLDriver, &testSQLSource, &testSQLSourceAdmin, &testSQLDatabaseName)
@@ -519,7 +522,7 @@ func TestCSInit(t *testing.T) {
 			case TypeRaft:
 				s, err = NewFileStore(testLogger, testRSDefaultDatastore, nil)
 				if err == nil {
-					s = NewRaftStore(s)
+					s = NewRaftStore(testLogger, s, nil)
 				}
 			default:
 				panic(fmt.Errorf("Add store type %q in this test", st.name))

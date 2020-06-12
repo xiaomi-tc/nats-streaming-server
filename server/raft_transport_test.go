@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,17 +17,17 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"log"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
-	"github.com/nats-io/gnatsd/server"
-	natsdTest "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/server"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
 )
 
 type testAddrProvider struct {
@@ -50,14 +50,18 @@ func (a *testLoggerAdapter) Write(d []byte) (int, error) {
 		d = d[:len(d)-1]
 	}
 	str := string(d)
-	if strings.Contains(str, "[ERR]") {
+	if strings.Contains(str, "[ERROR]") {
 		stackFatalf(a.t, "NetTransport error: %v", str)
 	}
 	return len(d), nil
 }
 
-func newTestLogger(t *testing.T) *log.Logger {
-	return log.New(&testLoggerAdapter{t: t}, "", log.Lmicroseconds)
+func newTestLogger(t *testing.T) hclog.Logger {
+	return hclog.New(&hclog.LoggerOptions{
+		Name:   natsLogAppName,
+		Level:  hclog.Debug,
+		Output: &testLoggerAdapter{t: t},
+	})
 }
 
 func runRaftTportServer() *server.Server {
@@ -124,7 +128,9 @@ func TestRAFTTransportHeartbeatFastPath(t *testing.T) {
 	trans1.SetHeartbeatHandler(fastpath)
 
 	// Transport 2 makes outbound request
-	trans2, err := newNATSTransportWithLogger("b", nc, time.Second, newTestLogger(t))
+	nc2 := newNatsConnection(t)
+	defer nc2.Close()
+	trans2, err := newNATSTransportWithLogger("b", nc2, time.Second, newTestLogger(t))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -167,7 +173,7 @@ func TestRAFTTransportAppendEntries(t *testing.T) {
 		PrevLogEntry: 100,
 		PrevLogTerm:  4,
 		Entries: []*raft.Log{
-			&raft.Log{
+			{
 				Index: 101,
 				Term:  4,
 				Type:  raft.LogNoop,
@@ -204,7 +210,9 @@ func TestRAFTTransportAppendEntries(t *testing.T) {
 	}()
 
 	// Transport 2 makes outbound request
-	trans2, err := newNATSTransportWithLogger("b", nc, time.Second, newTestLogger(t))
+	nc2 := newNatsConnection(t)
+	defer nc2.Close()
+	trans2, err := newNATSTransportWithLogger("b", nc2, time.Second, newTestLogger(t))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -247,7 +255,7 @@ func TestRAFTTransportAppendEntriesPipeline(t *testing.T) {
 		PrevLogEntry: 100,
 		PrevLogTerm:  4,
 		Entries: []*raft.Log{
-			&raft.Log{
+			{
 				Index: 101,
 				Term:  4,
 				Type:  raft.LogNoop,
@@ -285,7 +293,9 @@ func TestRAFTTransportAppendEntriesPipeline(t *testing.T) {
 	}()
 
 	// Transport 2 makes outbound request
-	trans2, err := newNATSTransportWithLogger("b", nc, time.Second, newTestLogger(t))
+	nc2 := newNatsConnection(t)
+	defer nc2.Close()
+	trans2, err := newNATSTransportWithLogger("b", nc2, time.Second, newTestLogger(t))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -372,7 +382,9 @@ func TestRAFTTransportRequestVote(t *testing.T) {
 	}()
 
 	// Transport 2 makes outbound request
-	trans2, err := newNATSTransportWithLogger("b", nc, time.Second, newTestLogger(t))
+	nc2 := newNatsConnection(t)
+	defer nc2.Close()
+	trans2, err := newNATSTransportWithLogger("b", nc2, time.Second, newTestLogger(t))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -455,7 +467,9 @@ func TestRAFTTransportInstallSnapshot(t *testing.T) {
 	}()
 
 	// Transport 2 makes outbound request
-	trans2, err := newNATSTransportWithLogger("b", nc, time.Second, newTestLogger(t))
+	nc2 := newNatsConnection(t)
+	defer nc2.Close()
+	trans2, err := newNATSTransportWithLogger("b", nc2, time.Second, newTestLogger(t))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -546,7 +560,7 @@ func TestRAFTTransportPooledConn(t *testing.T) {
 		PrevLogEntry: 100,
 		PrevLogTerm:  4,
 		Entries: []*raft.Log{
-			&raft.Log{
+			{
 				Index: 101,
 				Term:  4,
 				Type:  raft.LogNoop,
@@ -583,7 +597,9 @@ func TestRAFTTransportPooledConn(t *testing.T) {
 	}()
 
 	// Transport 2 makes outbound request, 3 conn pool
-	trans2, err := newNATSTransportWithLogger("b", nc, time.Second, newTestLogger(t))
+	nc2 := newNatsConnection(t)
+	defer nc2.Close()
+	trans2, err := newNATSTransportWithLogger("b", nc2, time.Second, newTestLogger(t))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

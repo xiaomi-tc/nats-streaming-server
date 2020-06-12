@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -31,15 +31,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/util"
+	"github.com/nats-io/stan.go/pb"
 )
 
 var (
 	testFSDefaultDatastore     string
 	testFSDisableBufferWriters bool
 	testFSSetFDsLimit          bool
+	testFSDisableReadBuffer    bool
 )
 
 var testFDsLimit = int64(5)
@@ -68,6 +69,9 @@ func newFileStore(t tLogger, dataStore string, limits *StoreLimits, options ...F
 	// Each test may override those.
 	if testFSDisableBufferWriters {
 		opts.BufferSize = 0
+	}
+	if testFSDisableReadBuffer {
+		opts.ReadBufferSize = 0
 	}
 	if testFSSetFDsLimit {
 		opts.FileDescriptorsLimit = testFDsLimit
@@ -572,6 +576,8 @@ func TestFSOptions(t *testing.T) {
 		SliceArchiveScript:   "myscript.sh",
 		FileDescriptorsLimit: 20,
 		ParallelRecovery:     5,
+		ReadBufferSize:       5 * 1024,
+		AutoSync:             2 * time.Minute,
 	}
 	// Create the file with custom options
 	fs, err := NewFileStore(testLogger, testFSDefaultDatastore, &testDefaultStoreLimits,
@@ -585,7 +591,9 @@ func TestFSOptions(t *testing.T) {
 		DoSync(expected.DoSync),
 		SliceConfig(100, 1024*1024, time.Second, "myscript.sh"),
 		FileDescriptorsLimit(20),
-		ParallelRecovery(5))
+		ParallelRecovery(5),
+		ReadBufferSize(5*1024),
+		AutoSync(2*time.Minute))
 	if err != nil {
 		t.Fatalf("Unexpected error on file store create: %v", err)
 	}
@@ -687,6 +695,9 @@ func TestFSOptions(t *testing.T) {
 	badOpts = DefaultFileStoreOptions
 	badOpts.SliceMaxAge = -1
 	expectError(&badOpts, "slice max values")
+	badOpts = DefaultFileStoreOptions
+	badOpts.ReadBufferSize = -1
+	expectError(&badOpts, "read buffer size")
 }
 
 func TestFSLimitsOnRecovery(t *testing.T) {
@@ -1380,7 +1391,7 @@ func TestFSReadRecord(t *testing.T) {
 
 	buf := make([]byte, 5)
 	var retBuf []byte
-	recType := recNoType
+	var recType recordType
 	recSize := 0
 
 	// Reader returns an error
@@ -1944,4 +1955,136 @@ func TestFSTruncateOnUnexpectedEOFLock(t *testing.T) {
 	// Now one can use the option again
 	s, _ = openDefaultFileStore(t, TruncateUnexpectedEOF(true))
 	s.Close()
+}
+
+func TestFSAutoSync(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	// Verify that auto sync can be disabled
+	s := createDefaultFileStore(t, BufferSize(1024), AutoSync(-100*time.Millisecond))
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	ms := c.Msgs.(*FileMsgStore)
+	ss := c.Subs.(*FileSubStore)
+
+	storeMsg(t, c, "foo", 1, []byte("hello"))
+	storeSub(t, c, "foo")
+
+	time.Sleep(150 * time.Millisecond)
+
+	checkMsgStoreFlushed := func(t *testing.T, ms *FileMsgStore, shouldBeFlushed bool) int64 {
+		t.Helper()
+		ms.Lock()
+		flushed := ms.bw != nil && ms.bw.buf != nil && ms.bw.buf.Buffered() == 0
+		synced := ms.synced
+		ms.Unlock()
+		if shouldBeFlushed && !flushed {
+			t.Fatalf("Message store should have been flushed")
+		} else if !shouldBeFlushed && flushed {
+			t.Fatalf("Message store should not have been flushed")
+		}
+		return synced
+	}
+	checkMsgStoreFlushed(t, ms, false)
+
+	checkSubStoreFlushed := func(t *testing.T, ss *FileSubStore, shouldBeFlushed bool) int64 {
+		t.Helper()
+		ss.Lock()
+		flushed := ss.bw != nil && ss.bw.buf != nil && ss.bw.buf.Buffered() == 0
+		synced := ss.synced
+		ss.Unlock()
+		if shouldBeFlushed && !flushed {
+			t.Fatalf("Subscription store should have been flushed")
+		} else if !shouldBeFlushed && flushed {
+			t.Fatalf("Subscription store should not have been flushed")
+		}
+		return synced
+	}
+	checkSubStoreFlushed(t, ss, false)
+
+	s.Close()
+	cleanupFSDatastore(t)
+	// Verify that auto sync works
+	s = createDefaultFileStore(t, BufferSize(1024), AutoSync(15*time.Millisecond))
+	defer s.Close()
+
+	c = storeCreateChannel(t, s, "foo")
+	ms = c.Msgs.(*FileMsgStore)
+	ss = c.Subs.(*FileSubStore)
+
+	storeMsg(t, c, "foo", 1, []byte("hello"))
+	storeSub(t, c, "foo")
+
+	time.Sleep(50 * time.Millisecond)
+
+	msSynced := checkMsgStoreFlushed(t, ms, true)
+	ssSynced := checkSubStoreFlushed(t, ss, true)
+
+	// Check that without new activity, there is no unnecessary sync'ing.
+	time.Sleep(100 * time.Millisecond)
+
+	if n := checkMsgStoreFlushed(t, ms, true); n != msSynced {
+		t.Fatalf("Message store is unnecessarily sync'ed (sync count was %v, now %v)", msSynced, n)
+	}
+	if n := checkSubStoreFlushed(t, ss, true); n != ssSynced {
+		t.Fatalf("Subscription store is unnecessarily sync'ed (sync count was %v, now %v)", ssSynced, n)
+	}
+
+	// Add new activity and check things are now updated.
+	storeMsg(t, c, "foo", 2, []byte("hello"))
+	storeSub(t, c, "foo")
+
+	time.Sleep(50 * time.Millisecond)
+
+	if n := checkMsgStoreFlushed(t, ms, true); n == msSynced {
+		t.Fatalf("Message store was not sync'ed after new activity (sync count was %v, now %v)", msSynced, n)
+	}
+	if n := checkSubStoreFlushed(t, ss, true); n == ssSynced {
+		t.Fatalf("Subscription store was not sync'ed after new activity (sync count was %v, now %v)", ssSynced, n)
+	}
+}
+
+func TestFSServerAndClientFilesVersionError(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		server bool
+		fname  string
+	}{
+		{"server", true, serverFileName},
+		{"client", false, clientsFileName},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanupFSDatastore(t)
+			defer cleanupFSDatastore(t)
+
+			s := createDefaultFileStore(t)
+			defer s.Close()
+
+			var fname string
+			s.Lock()
+			if test.server {
+				fname = s.serverFile.name
+			} else {
+				fname = s.clientsFile.name
+			}
+			s.Unlock()
+
+			s.Close()
+			os.Remove(fname)
+			if err := ioutil.WriteFile(fname, []byte(""), 0666); err != nil {
+				t.Fatalf("Error creating file: %v", err)
+			}
+
+			s, err := NewFileStore(testLogger, testFSDefaultDatastore, nil)
+			if err != nil {
+				t.Fatalf("Error creating file store: %v", err)
+			}
+			defer s.Close()
+			if _, err := s.Recover(); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("unable to recover %s file %q", test.name, test.fname)) {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		})
+	}
 }

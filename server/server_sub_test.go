@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,12 +20,12 @@ import (
 	"testing"
 	"time"
 
-	natsdTest "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func TestSubscribeShrink(t *testing.T) {
@@ -843,11 +843,11 @@ func TestTraceSubCreateCloseUnsubscribeRequests(t *testing.T) {
 		suffix bool
 	}
 	subOpts := []optAndText{
-		optAndText{stan.StartAt(pb.StartPosition_NewOnly), "new-only, seq=1", true},
-		optAndText{stan.StartWithLastReceived(), "last message, seq=1", true},
-		optAndText{stan.StartAtSequence(10), "from sequence, asked_seq=10 actual_seq=1", true},
-		optAndText{stan.StartAt(pb.StartPosition_First), "from beginning, seq=1", true},
-		optAndText{stan.StartAtTimeDelta(time.Hour), "from time time=", false},
+		{stan.StartAt(pb.StartPosition_NewOnly), "new-only, seq=1", true},
+		{stan.StartWithLastReceived(), "last message, seq=1", true},
+		{stan.StartAtSequence(10), "from sequence, asked_seq=10 actual_seq=1", true},
+		{stan.StartAt(pb.StartPosition_First), "from beginning, seq=1", true},
+		{stan.StartAtTimeDelta(time.Hour), "from time time=", false},
 	}
 	for _, o := range subOpts {
 		sub, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, o.opt)
@@ -891,21 +891,21 @@ func TestTraceSubCreateCloseUnsubscribeRequests(t *testing.T) {
 	}
 	ssubs := []startSub{
 		// New plain subscription followed by Unsubscribe should remove the subscription
-		startSub{
+		{
 			start:      func() (stan.Subscription, error) { return sc.Subscribe("foo", func(_ *stan.Msg) {}) },
 			startTrace: "Started new subscription",
 			end:        func(sub stan.Subscription) error { return sub.Unsubscribe() },
 			endTrace:   "Removed subscription",
 		},
 		// New plain subscription followed by Close should remove the subscription
-		startSub{
+		{
 			start:      func() (stan.Subscription, error) { return sc.Subscribe("foo", func(_ *stan.Msg) {}) },
 			startTrace: "Started new subscription",
 			end:        func(sub stan.Subscription) error { return sub.Close() },
 			endTrace:   "Removed subscription",
 		},
 		// New durable subscription followed by Close should suspend the subscription
-		startSub{
+		{
 			start: func() (stan.Subscription, error) {
 				return sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur"))
 			},
@@ -914,7 +914,7 @@ func TestTraceSubCreateCloseUnsubscribeRequests(t *testing.T) {
 			endTrace:   "Suspended durable subscription",
 		},
 		// Resuming the durable subscription, followed by Unsubscribe should removed the subscription
-		startSub{
+		{
 			start: func() (stan.Subscription, error) {
 				return sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur"))
 			},
@@ -923,41 +923,41 @@ func TestTraceSubCreateCloseUnsubscribeRequests(t *testing.T) {
 			endTrace:   "Removed durable subscription",
 		},
 		// Non durable queue subscribption
-		startSub{
+		{
 			start:      func() (stan.Subscription, error) { return sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}) },
 			startTrace: "Started new queue subscription",
 			end:        func(sub stan.Subscription) error { return nil }, endTrace: "",
 		},
 		// Adding a member followed by Unsubscribe should simply remove this member.
-		startSub{
+		{
 			start:      func() (stan.Subscription, error) { return sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}) },
 			startTrace: "Added member to queue subscription",
 			end:        func(sub stan.Subscription) error { return sub.Unsubscribe() },
 			endTrace:   "Removed member from queue subscription",
 		},
 		// Adding a member followed by Close should simply remove this member.
-		startSub{
+		{
 			start:      func() (stan.Subscription, error) { return sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}) },
 			startTrace: "Added member to queue subscription",
 			end:        func(sub stan.Subscription) error { return sub.Close() },
 			endTrace:   "Removed member from queue subscription",
 		},
 		// New queue subscription followed by Unsubscribe should remove the queue subscription
-		startSub{
+		{
 			start:      func() (stan.Subscription, error) { return sc.QueueSubscribe("foo", "queue2", func(_ *stan.Msg) {}) },
 			startTrace: "Started new queue subscription",
 			end:        func(sub stan.Subscription) error { return sub.Unsubscribe() },
 			endTrace:   "Removed queue subscription",
 		},
 		// New queue subscription followed by Close should remove the queue subscription
-		startSub{
+		{
 			start:      func() (stan.Subscription, error) { return sc.QueueSubscribe("foo", "queue2", func(_ *stan.Msg) {}) },
 			startTrace: "Started new queue subscription",
 			end:        func(sub stan.Subscription) error { return sub.Close() },
 			endTrace:   "Removed queue subscription",
 		},
 		// New durable queue subscription followed by Close should suspend the subscription
-		startSub{
+		{
 			start: func() (stan.Subscription, error) {
 				return sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur"))
 			},
@@ -966,7 +966,7 @@ func TestTraceSubCreateCloseUnsubscribeRequests(t *testing.T) {
 			endTrace:   "Suspended durable queue subscription",
 		},
 		// Resuming durable queue subscription
-		startSub{
+		{
 			start: func() (stan.Subscription, error) {
 				return sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur"))
 			},
@@ -974,7 +974,7 @@ func TestTraceSubCreateCloseUnsubscribeRequests(t *testing.T) {
 			end:        func(sub stan.Subscription) error { return nil }, endTrace: "",
 		},
 		// Adding a member followed by Close should remove this member only
-		startSub{
+		{
 			start: func() (stan.Subscription, error) {
 				return sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur"))
 			},
@@ -983,7 +983,7 @@ func TestTraceSubCreateCloseUnsubscribeRequests(t *testing.T) {
 			endTrace:   "Removed member from durable queue subscription",
 		},
 		// Adding a member followed by Unsubscribe should remove this member only
-		startSub{
+		{
 			start: func() (stan.Subscription, error) {
 				return sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur"))
 			},
@@ -992,7 +992,7 @@ func TestTraceSubCreateCloseUnsubscribeRequests(t *testing.T) {
 			endTrace:   "Removed member from durable queue subscription",
 		},
 		// New durable subscription followed by Unsubscribe should remove the subscription
-		startSub{
+		{
 			start: func() (stan.Subscription, error) {
 				return sc.QueueSubscribe("foo", "queue2", func(_ *stan.Msg) {}, stan.DurableName("dur"))
 			},
@@ -1143,4 +1143,141 @@ func TestSubAckInboxFromOlderStore(t *testing.T) {
 	case <-time.After(1500 * time.Millisecond):
 		// ok...
 	}
+}
+
+func checkNumSubs(t *testing.T, s *StanServer, expected int) {
+	t.Helper()
+	waitFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		count := s.numSubs()
+		if count != expected {
+			return fmt.Errorf("Expected %v subscriptions, got %v", expected, count)
+		}
+		return nil
+	})
+}
+
+func TestNumSubs(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	opts := getTestDefaultOptsForPersistentStore()
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
+	s := runServerWithOpts(t, opts, nil)
+	defer shutdownRestartedServerOnTestExit(&s)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	dur, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, s, 1)
+
+	s.Shutdown()
+	s = runServerWithOpts(t, opts, nil)
+
+	checkNumSubs(t, s, 1)
+	dur.Close()
+	checkNumSubs(t, s, 1)
+
+	s.Shutdown()
+	s = runServerWithOpts(t, opts, nil)
+
+	checkNumSubs(t, s, 1)
+
+	// Resume the durable
+	dur, err = sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	checkNumSubs(t, s, 1)
+	// Now unsubscribe
+	dur.Unsubscribe()
+	checkNumSubs(t, s, 0)
+	sc.Close()
+
+	s.Shutdown()
+	s = runServerWithOpts(t, opts, nil)
+	checkNumSubs(t, s, 0)
+}
+
+func TestNumSubsOnSubFailure(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+
+	s.channels.Lock()
+	s.channels.store = &mockedStore{Store: s.channels.store}
+	s.channels.Unlock()
+
+	cs, _ := s.lookupOrCreateChannel("foo")
+	mss := cs.store.Subs.(*mockedSubStore)
+	mss.Lock()
+	mss.fail = true
+	mss.Unlock()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	checkNumSubs(t, s, 0)
+	// Create a plain sub that fails
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err == nil {
+		t.Fatalf("Expected failure")
+	}
+	checkNumSubs(t, s, 0)
+	// Try with durable
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur")); err == nil {
+		t.Fatalf("Expected failure")
+	}
+	checkNumSubs(t, s, 0)
+	// And queue durable
+	if _, err := sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur")); err == nil {
+		t.Fatalf("Expected failure")
+	}
+
+	mss.Lock()
+	mss.fail = false
+	mss.Unlock()
+
+	// Now create a durable and durable queue group.
+	dur, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on sub: %v", err)
+	}
+	qdur, err := sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on sub: %v", err)
+	}
+	checkNumSubs(t, s, 2)
+	// Close them
+	dur.Close()
+	checkNumSubs(t, s, 2)
+	qdur.Close()
+	checkNumSubs(t, s, 2)
+
+	// Enable failure again
+	mss.Lock()
+	mss.fail = true
+	mss.Unlock()
+	// Try to resume, which should fail
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur")); err == nil {
+		t.Fatalf("Expected failure")
+	}
+	checkNumSubs(t, s, 2)
+	if _, err := sc.QueueSubscribe("foo", "queue", func(_ *stan.Msg) {}, stan.DurableName("dur")); err == nil {
+		t.Fatalf("Expected failure")
+	}
+	checkNumSubs(t, s, 2)
+
+	// Now add a plain sub which will fail, then close connection
+	// and make sure count is not decremented.
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}, stan.DurableName("dur2")); err == nil {
+		t.Fatalf("Expected error")
+	}
+	checkNumSubs(t, s, 2)
+	sc.Close()
+	checkNumSubs(t, s, 2)
 }

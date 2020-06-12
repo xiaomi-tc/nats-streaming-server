@@ -1,4 +1,4 @@
-// Copyright 2018 The NATS Authors
+// Copyright 2018-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,8 +21,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func TestCryptoStoreKeyIsCleared(t *testing.T) {
@@ -492,4 +493,26 @@ func TestCryptoStoreMultipleCiphers(t *testing.T) {
 			t.Fatalf("Expected message %q, got %q", payloads[i], rm.Data)
 		}
 	}
+}
+
+func TestCryptoFileAutoSync(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	fs, _ := newFileStore(t, testFSDefaultDatastore, nil, AutoSync(15*time.Millisecond))
+	s, err := NewCryptoStore(fs, CryptoCipherAES, []byte("testkey"))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	// Add some state
+	cs := storeCreateChannel(t, s, "foo")
+	storeMsg(t, cs, "foo", 1, []byte("msg"))
+	storeSub(t, cs, "foo")
+
+	// Wait for auto sync to kick in
+	time.Sleep(50 * time.Millisecond)
+
+	// Server should not have panic'ed.
 }

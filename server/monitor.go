@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,18 +24,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	gnatsd "github.com/nats-io/gnatsd/server"
+	natsd "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats-streaming-server/stores"
 	"github.com/prometheus/procfs"
 )
 
 // Routes for the monitoring pages
 const (
-	RootPath     = "/streaming"
-	ServerPath   = RootPath + "/serverz"
-	StorePath    = RootPath + "/storez"
-	ClientsPath  = RootPath + "/clientsz"
-	ChannelsPath = RootPath + "/channelsz"
+	RootPath       = "/streaming"
+	ServerPath     = RootPath + "/serverz"
+	StorePath      = RootPath + "/storez"
+	ClientsPath    = RootPath + "/clientsz"
+	ChannelsPath   = RootPath + "/channelsz"
+	IsFTActivePath = RootPath + "/isFTActive"
 
 	defaultMonitorListLimit = 1024
 )
@@ -56,6 +57,10 @@ type Serverz struct {
 	Channels      int       `json:"channels"`
 	TotalMsgs     int       `json:"total_msgs"`
 	TotalBytes    uint64    `json:"total_bytes"`
+	InMsgs        int64     `json:"in_msgs"`
+	InBytes       int64     `json:"in_bytes"`
+	OutMsgs       int64     `json:"out_msgs"`
+	OutBytes      int64     `json:"out_bytes"`
 	OpenFDs       int       `json:"open_fds,omitempty"`
 	MaxFDs        int       `json:"max_fds,omitempty"`
 }
@@ -129,12 +134,16 @@ type Subscriptionz struct {
 	IsStalled    bool   `json:"is_stalled"`
 }
 
-func (s *StanServer) startMonitoring(nOpts *gnatsd.Options) error {
+func (s *StanServer) startMonitoring(nOpts *natsd.Options) error {
 	var hh http.Handler
 	// If we are connecting to remote NATS Server, we start our own
 	// HTTP(s) server.
 	if s.opts.NATSServerURL != "" {
-		s.natsServer = gnatsd.New(nOpts)
+		ns, err := natsd.NewServer(nOpts)
+		if err != nil {
+			return err
+		}
+		s.natsServer = ns
 		if err := s.natsServer.StartMonitoring(); err != nil {
 			return err
 		}
@@ -152,6 +161,7 @@ func (s *StanServer) startMonitoring(nOpts *gnatsd.Options) error {
 	mux.HandleFunc(StorePath, s.handleStorez)
 	mux.HandleFunc(ClientsPath, s.handleClientsz)
 	mux.HandleFunc(ChannelsPath, s.handleChannelsz)
+	mux.HandleFunc(IsFTActivePath, s.handleIsFTActivez)
 
 	return nil
 }
@@ -192,9 +202,8 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		role = s.raft.State().String()
 	}
 	s.mu.RUnlock()
-	s.monMu.RLock()
-	numSubs := s.numSubs
-	s.monMu.RUnlock()
+
+	numSubs := s.numSubs()
 	now := time.Now()
 
 	fds := 0
@@ -205,7 +214,7 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Error getting file descriptors len: %v", err), http.StatusInternalServerError)
 			return
 		}
-		limits, err := p.NewLimits()
+		limits, err := p.Limits()
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Error getting process limits: %v", err), http.StatusInternalServerError)
 			return
@@ -228,10 +237,25 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		Subscriptions: numSubs,
 		TotalMsgs:     count,
 		TotalBytes:    bytes,
+		InMsgs:        atomic.LoadInt64(&s.stats.inMsgs),
+		InBytes:       atomic.LoadInt64(&s.stats.inBytes),
+		OutMsgs:       atomic.LoadInt64(&s.stats.outMsgs),
+		OutBytes:      atomic.LoadInt64(&s.stats.outBytes),
 		OpenFDs:       fds,
 		MaxFDs:        maxFDs,
 	}
 	s.sendResponse(w, r, serverz)
+}
+
+func (s *StanServer) handleIsFTActivez(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
+	if state == FTActive {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func myUptime(d time.Duration) string {
@@ -502,18 +526,12 @@ func (s *StanServer) updateChannelz(cz *Channelz, c *channel, subsOption int) er
 	if err != nil {
 		return fmt.Errorf("unable to get message state: %v", err)
 	}
-	fseq, lseq, err := c.store.Msgs.FirstAndLastSequence()
+	fseq, lseq, err := s.getChannelFirstAndlLastSeq(c)
 	if err != nil {
 		return fmt.Errorf("unable to get first and last sequence: %v", err)
 	}
 	cz.Msgs = msgs
 	cz.Bytes = bytes
-	if fseq == 0 && lseq == 0 && s.isClustered {
-		fseq = atomic.LoadUint64(&c.firstSeq)
-		if fseq > 1 {
-			lseq = fseq - 1
-		}
-	}
 	cz.FirstSeq = fseq
 	cz.LastSeq = lseq
 	if subsOption == 1 {
@@ -527,7 +545,7 @@ func (s *StanServer) sendResponse(w http.ResponseWriter, r *http.Request, conten
 	if err != nil {
 		s.log.Errorf("Error marshaling response to %q request: %v", r.URL, err)
 	}
-	gnatsd.ResponseHandler(w, r, b)
+	natsd.ResponseHandler(w, r, b)
 }
 
 func getOffsetAndLimit(r *http.Request) (int, int) {

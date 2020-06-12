@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,8 +26,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/util"
+	"github.com/nats-io/stan.go/pb"
 )
 
 const (
@@ -1442,8 +1442,8 @@ type testFSGapsOption struct {
 func testFSGetOptionsForGapsTests() []testFSGapsOption {
 	defaultOptions := DefaultFileStoreOptions
 	opts := []testFSGapsOption{
-		testFSGapsOption{"Default", AllOptions(&defaultOptions)},
-		testFSGapsOption{"NoBuffer", BufferSize(0)},
+		{"Default", AllOptions(&defaultOptions)},
+		{"NoBuffer", BufferSize(0)},
 	}
 	return opts
 }
@@ -1745,6 +1745,40 @@ func TestFSRecoverEmptyIndexMsgFile(t *testing.T) {
 	}
 }
 
+func TestFSEmptyRemovesAllMsgsFiles(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	s := createDefaultFileStore(t)
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	ms := c.Msgs
+	storeMsg(t, c, "foo", 1, []byte("msg"))
+	ms.(*FileMsgStore).RLock()
+	datname := ms.(*FileMsgStore).writeSlice.file.name
+	idxname := ms.(*FileMsgStore).writeSlice.idxFile.name
+	ms.(*FileMsgStore).RUnlock()
+	s.Close()
+
+	os.Remove(datname)
+
+	s, rs := openDefaultFileStore(t)
+	defer s.Close()
+
+	c = getRecoveredChannel(t, rs, "foo")
+	if n, b := msgStoreState(t, c.Msgs); n != 0 || b != 0 {
+		t.Fatalf("Unexpected state: %v - %v", n, b)
+	}
+	if err := c.Msgs.Empty(); err != nil {
+		t.Fatalf("Error on empty: %v", err)
+	}
+	// Make sure we have remove the index file too.
+	if fi, err := os.Stat(idxname); err == nil || fi != nil {
+		t.Fatalf("Expected index file to be gone, it was not")
+	}
+}
+
 func TestFSGetSeqFromTimestamp(t *testing.T) {
 	cleanupFSDatastore(t)
 	defer cleanupFSDatastore(t)
@@ -1799,7 +1833,7 @@ func TestFSNoPanicOnRemoveMsg(t *testing.T) {
 
 	limits := testDefaultStoreLimits
 	limits.MaxMsgs = 5
-	s, err := NewFileStore(l, testFSDefaultDatastore, &limits, BufferSize(0), DoCRC(false))
+	s, err := NewFileStore(l, testFSDefaultDatastore, &limits, BufferSize(0))
 	if err != nil {
 		t.Fatalf("Error creating store: %v", err)
 	}
@@ -1820,7 +1854,7 @@ func TestFSNoPanicOnRemoveMsg(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error reading file: %v", err)
 	}
-	util.ByteOrder.PutUint64(content[4:], 2)
+	copy(content[4:], []byte("xxx"))
 	if err := ioutil.WriteFile(idxFile.name, content, 0600); err != nil {
 		t.Fatalf("Error writing file: %v", err)
 	}
@@ -1839,5 +1873,453 @@ func TestFSNoPanicOnRemoveMsg(t *testing.T) {
 	l.Unlock()
 	if !gotIt {
 		t.Fatal("Did not get error about removing message")
+	}
+}
+
+func TestFSReadBuffer(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	cacheTTL = int64(5 * time.Second)
+	defer func() { cacheTTL = testFSDefaultCacheTTL }()
+
+	limits := testDefaultStoreLimits
+	s, err := NewFileStore(testLogger, testFSDefaultDatastore, &limits, BufferSize(0), ReadBufferSize(0))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	for i := uint64(1); i <= 10; i++ {
+		storeMsg(t, c, "foo", i, []byte(fmt.Sprintf("%v", i)))
+	}
+	c.Msgs.Flush()
+
+	// Force empty of cache
+	ms := c.Msgs.(*FileMsgStore)
+	ms.Lock()
+	ms.cache.empty()
+	ms.Unlock()
+
+	// Lookup first message and check that it is in the cache.
+	m := msgStoreLookup(t, c.Msgs, 1)
+	if string(m.Data) != "1" {
+		t.Fatalf("Expected message's data to be %q, got %q", "1", m.Data)
+	}
+	// Ensure that other messages are not in the cache
+	for i := uint64(2); i <= 10; i++ {
+		ms.Lock()
+		m := ms.cache.get(i)
+		ms.Unlock()
+		if m != nil {
+			t.Fatalf("Expected msg seq %v to not be in the cache, got %v", i, m)
+		}
+	}
+
+	s.Close()
+	cleanupFSDatastore(t)
+
+	// Restart test but now with a read buffer...
+	s, err = NewFileStore(testLogger, testFSDefaultDatastore, &limits, BufferSize(0), ReadBufferSize(1024*1024))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	c = storeCreateChannel(t, s, "foo")
+	for i := uint64(1); i <= 10; i++ {
+		storeMsg(t, c, "foo", i, []byte(fmt.Sprintf("%v", i)))
+	}
+	c.Msgs.Flush()
+
+	// Force empty of cache
+	ms = c.Msgs.(*FileMsgStore)
+	ms.Lock()
+	ms.cache.empty()
+	ms.Unlock()
+
+	// Lookup first message
+	msgStoreLookup(t, c.Msgs, 1)
+	// All others should have been added to the cache
+	for i := uint64(1); i <= 10; i++ {
+		ms.Lock()
+		m := ms.cache.get(i)
+		ms.Unlock()
+		if m == nil {
+			t.Fatalf("Expected msg seq %v to be in cache, it was not", i)
+		}
+		if string(m.Data) != fmt.Sprintf("%v", i) {
+			t.Fatalf("Expected content to be %q, got %q", i, m.Data)
+		}
+	}
+
+	// Empty cache
+	ms.Lock()
+	ms.cache.empty()
+	ms.Unlock()
+
+	// Lookup message 8, which should load 9 and 10 too
+	msgStoreLookup(t, c.Msgs, 8)
+	for i := uint64(8); i <= 10; i++ {
+		ms.Lock()
+		m := ms.cache.get(i)
+		ms.Unlock()
+		if m == nil {
+			t.Fatalf("Expected msg seq %v to be in cache, it was not", i)
+		}
+		if string(m.Data) != fmt.Sprintf("%v", i) {
+			t.Fatalf("Expected content to be %q, got %q", i, m.Data)
+		}
+	}
+
+	// Now lookup message 1, ensure that cache has only 10 elements...
+	msgStoreLookup(t, c.Msgs, 1)
+	ms.Lock()
+	sizeCache := 0
+	for cur := ms.cache.head; cur != nil; cur = cur.next {
+		sizeCache++
+	}
+	ms.Unlock()
+	if sizeCache != 10 {
+		t.Fatalf("Expected cache size to be 10, got %v", sizeCache)
+	}
+
+	s.Close()
+	cleanupFSDatastore(t)
+
+	// Restart test but now with a read buffer that is too small for a single message
+	s, err = NewFileStore(testLogger, testFSDefaultDatastore, &limits, BufferSize(0), ReadBufferSize(500))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	payload := make([]byte, 600)
+	c = storeCreateChannel(t, s, "foo")
+	for i := uint64(1); i <= 2; i++ {
+		storeMsg(t, c, "foo", i, payload)
+	}
+	c.Msgs.Flush()
+
+	// Force empty of cache
+	ms = c.Msgs.(*FileMsgStore)
+	ms.Lock()
+	ms.cache.empty()
+	ms.Unlock()
+
+	// Lookup first message
+	msgStoreLookup(t, c.Msgs, 1)
+	// Ensure that other message is not in the cache
+	ms.Lock()
+	m = ms.cache.get(2)
+	ms.Unlock()
+	if m != nil {
+		t.Fatalf("Expected msg seq 2 to not be in the cache, got %v", m)
+	}
+}
+
+func TestFSReadMsgRecord(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	s := createDefaultFileStore(t)
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	ms := c.Msgs.(*FileMsgStore)
+
+	r := &testReader{}
+
+	var err error
+
+	buf := make([]byte, recordHeaderSize+5)
+	var retBuf []byte
+
+	// Reader returns an error
+	errReturned := fmt.Errorf("Fake error")
+	r.setErrToReturn(errReturned)
+	retBuf, err = ms.readMsgRecord(r, buf, 1)
+	if !strings.Contains(err.Error(), errReturned.Error()) {
+		t.Fatalf("Expected error %v, got: %v", errReturned, err)
+	}
+	if !reflect.DeepEqual(retBuf, buf) {
+		t.Fatal("Expected returned buffer to be same as the one provided")
+	}
+
+	// Record not containing CRC
+	_header := [4]byte{}
+	header := _header[:]
+	util.ByteOrder.PutUint32(header, 0)
+	r.setErrToReturn(nil)
+	r.setContent(header)
+	retBuf, err = ms.readMsgRecord(r, buf, 1)
+	if err == nil {
+		t.Fatal("Expected error got none")
+	}
+	if !reflect.DeepEqual(retBuf, buf) {
+		t.Fatal("Expected returned buffer to be same as the one provided")
+	}
+
+	// Wrong CRC
+	b := make([]byte, recordHeaderSize+5)
+	util.ByteOrder.PutUint32(b, 5)
+	copy(b[recordHeaderSize:], []byte("hello"))
+	r.setErrToReturn(nil)
+	r.setContent(b)
+	retBuf, err = ms.readMsgRecord(r, buf, 5)
+	if err == nil {
+		t.Fatal("Expected error got none")
+	}
+	if !reflect.DeepEqual(retBuf, b) {
+		t.Fatal("Expected returned buffer to be same as the one provided")
+	}
+
+	// Not asking for CRC should return ok
+	r.setContent(b)
+	ms.fstore.opts.DoCRC = false
+	retBuf, err = ms.readMsgRecord(r, buf, 5)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(retBuf, buf) {
+		t.Fatal("Expected returned buffer to be same as the one provided")
+	}
+	if string(retBuf[recordHeaderSize:recordHeaderSize+5]) != "hello" {
+		t.Fatalf("Expected body to be \"hello\", got %q", string(retBuf[recordHeaderSize:recordHeaderSize+5]))
+	}
+
+	// Check that returned buffer has expanded as required
+	ms.fstore.opts.DoCRC = true
+	b = make([]byte, recordHeaderSize+10)
+	payload := []byte("hellohello")
+	util.ByteOrder.PutUint32(b, uint32(len(payload)))
+	util.ByteOrder.PutUint32(b[4:recordHeaderSize], crc32.ChecksumIEEE(payload))
+	copy(b[recordHeaderSize:], payload)
+	r.setErrToReturn(nil)
+	r.setContent(b)
+	retBuf, err = ms.readMsgRecord(r, buf, 10)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if reflect.DeepEqual(retBuf, buf) {
+		t.Fatal("Expected returned buffer to be different than the one provided")
+	}
+	if string(retBuf[recordHeaderSize:recordHeaderSize+10]) != string(payload) {
+		t.Fatalf("Expected body to be %q got %v", string(payload), string(retBuf[recordHeaderSize:recordHeaderSize+10]))
+	}
+
+	// Append zeros to the end of buffer
+	for i := 0; i < recordHeaderSize+2; i++ {
+		b = append(b, 0)
+	}
+	// Don't call setContent since this would reset the read position
+	r.content = b
+	if _, err := ms.readMsgRecord(r, buf, 2); err != errNeedRewind {
+		t.Fatalf("Expected error %v, got %v", errNeedRewind, err)
+	}
+
+	// Check that error returned if size does not match
+	b = b[:len(b)-2]
+	r.setContent(b)
+	if _, err := ms.readMsgRecord(r, buf, 8); err == nil || !strings.Contains(err.Error(), "expected size") {
+		t.Fatalf("Expected error about wrong size, got %v", err)
+	}
+}
+
+func TestFSGapsInSequenceWithoutFillAndExpiration(t *testing.T) {
+	opts := testFSGetOptionsForGapsTests()
+	// Add case with smaller slice
+	opts = append(opts, testFSGapsOption{
+		name: "SmallFileSlice",
+		opt:  SliceConfig(3, 0, 0, ""),
+	})
+	for _, o := range opts {
+		t.Run(o.name, func(t *testing.T) {
+			fillGaps = false
+			defer func() { fillGaps = true }()
+
+			cleanupFSDatastore(t)
+			defer cleanupFSDatastore(t)
+
+			s := createDefaultFileStore(t, o.opt)
+			defer s.Close()
+
+			limits := testDefaultStoreLimits
+			limits.MaxMsgs = 6
+			s.SetLimits(&limits)
+
+			c := storeCreateChannel(t, s, "foo")
+			ms := c.Msgs.(*FileMsgStore)
+
+			seqs := []uint64{1, 2, 5, 8, 9, 10}
+			for _, seq := range seqs {
+				storeMsg(t, c, "foo", seq, []byte(fmt.Sprintf("msg%d", seq)))
+			}
+			ms.Flush()
+			ms.Lock()
+			ms.cache.empty()
+			ms.Unlock()
+
+			for _, seq := range seqs {
+				msg, err := ms.Lookup(seq)
+				if err != nil {
+					t.Fatalf("Error on lookup: %v", err)
+				}
+				if msg.Sequence != seq || string(msg.Data) != fmt.Sprintf("msg%d", seq) {
+					t.Fatalf("Unexpected message for seq %v: %v", seq, msg)
+				}
+			}
+
+			notfound := []uint64{3, 6, 7}
+			for _, seq := range notfound {
+				msg, err := ms.Lookup(seq)
+				if err != nil || msg != nil {
+					t.Fatalf("Unexpected result err=%v msg=%v", err, msg)
+				}
+			}
+
+			// Add more messages to force 3 first to be removed,
+			// and in the case of the small slice option, should
+			// cause first slice to be removed.
+			// Add some more gaps..
+			storeMsg(t, c, "foo", 12, []byte("msg12"))
+			storeMsg(t, c, "foo", 14, []byte("msg14"))
+			storeMsg(t, c, "foo", 16, []byte("msg16"))
+
+			first, last := msgStoreFirstAndLastSequence(t, ms)
+			if first != 8 && last != 16 {
+				t.Fatalf("Expected first to be 8 and last to be 16, got %v and %v", first, last)
+			}
+
+			expectFirsSliceToBe := func(t *testing.T, expected int) {
+				ms.Lock()
+				ffseq := ms.firstFSlSeq
+				ms.Unlock()
+				if ffseq != expected {
+					t.Fatalf("First slice expected to be %v, got %v", expected, ffseq)
+				}
+			}
+			if o.name == "SmallFileSlice" {
+				expectFirsSliceToBe(t, 2)
+			} else {
+				expectFirsSliceToBe(t, 1)
+			}
+
+			storeMsg(t, c, "foo", 18, []byte("msg18"))
+			storeMsg(t, c, "foo", 19, []byte("msg19"))
+			storeMsg(t, c, "foo", 20, []byte("msg20"))
+
+			// Force expiration..
+			time.Sleep(50 * time.Millisecond)
+			ms.Lock()
+			ms.expireMsgs(time.Now().UnixNano(), int64(time.Millisecond))
+			ms.Unlock()
+
+			n, b, err := ms.State()
+			if err != nil {
+				t.Fatalf("Error getting state: %v", err)
+			}
+			if n != 0 || b != 0 {
+				t.Fatalf("Unexpected number of msgs: %v bytes: %v", n, b)
+			}
+
+			if o.name == "SmallFileSlice" {
+				expectFirsSliceToBe(t, 4)
+			} else {
+				expectFirsSliceToBe(t, 1)
+			}
+		})
+	}
+}
+
+func TestFSExpirationError(t *testing.T) {
+	cleanupFSDatastore(t)
+	defer cleanupFSDatastore(t)
+
+	s := createDefaultFileStore(t)
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	ms := c.Msgs.(*FileMsgStore)
+
+	storeMsg(t, c, "foo", 1, []byte("msg"))
+	ms.Flush()
+	ms.Lock()
+	ms.cache.empty()
+	ms.Unlock()
+
+	ms.Lock()
+	idxFile := ms.files[1].idxFile
+	ms.fm.closeLockedOrOpenedFile(idxFile)
+	content, err := ioutil.ReadFile(idxFile.name)
+	if err != nil {
+		t.Fatalf("Error reading file: %v", err)
+	}
+	copy(content[4:], []byte("xxx"))
+	if err := ioutil.WriteFile(idxFile.name, content, 0600); err != nil {
+		t.Fatalf("Error writing file: %v", err)
+	}
+	ms.Unlock()
+
+	time.Sleep(50 * time.Millisecond)
+	ms.Lock()
+	now := time.Now().UnixNano()
+	nextExpiration := ms.expireMsgs(time.Now().UnixNano(), int64(time.Millisecond))
+	ms.Unlock()
+	if nextExpiration < now+int64(4500*time.Millisecond) {
+		t.Fatalf("Expected next expiration to be set to 5secs from now, got %v", time.Duration(nextExpiration))
+	}
+}
+
+func TestFSMsgsFileVersionError(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		dat    bool
+		suffix string
+	}{
+		{"data", true, datSuffix},
+		{"index", false, idxSuffix},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanupFSDatastore(t)
+			defer cleanupFSDatastore(t)
+
+			s := createDefaultFileStore(t)
+			defer s.Close()
+
+			c := storeCreateChannel(t, s, "foo")
+			storeMsg(t, c, "foo", 1, []byte("hello"))
+			if err := c.Msgs.Flush(); err != nil {
+				t.Fatalf("Error flushing store: %v", err)
+			}
+			var fname string
+			ms := c.Msgs.(*FileMsgStore)
+			ms.Lock()
+			if test.dat {
+				fname = ms.files[1].file.name
+			} else {
+				fname = ms.files[1].idxFile.name
+			}
+			ms.Unlock()
+
+			s.Close()
+
+			os.Remove(fname)
+			if err := ioutil.WriteFile(fname, []byte(""), 0666); err != nil {
+				t.Fatalf("Error writing file: %v", err)
+			}
+
+			s, err := NewFileStore(testLogger, testFSDefaultDatastore, nil)
+			if err != nil {
+				t.Fatalf("Error creating filestore: %v", err)
+			}
+			defer s.Close()
+			if _, err := s.Recover(); err == nil ||
+				!strings.Contains(err.Error(), "unable to recover message store for [foo]") ||
+				!strings.Contains(err.Error(), fmt.Sprintf("%s1%s", msgFilesPrefix, test.suffix)) {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		})
 	}
 }

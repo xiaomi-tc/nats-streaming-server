@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,14 +15,17 @@ package server
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats-streaming-server/test"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func testStalledDelivery(t *testing.T, typeSub string) {
@@ -251,5 +254,236 @@ func TestDeliveryWithGapsInSequence(t *testing.T) {
 	case e := <-errCh:
 		t.Fatalf(e.Error())
 	default:
+	}
+}
+
+func TestPersistentStoreSQLSubsPendingRows(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+	source := testSQLSource
+	if persistentStoreType != stores.TypeSQL {
+		// If not running tests with `-persistent_store sql`,
+		// initialize few things and default to MySQL.
+		source = testDefaultMySQLSource
+		sourceAdmin := testDefaultMySQLSourceAdmin
+		if err := test.CreateSQLDatabase(testSQLDriver, sourceAdmin,
+			source, testSQLDatabaseName); err != nil {
+			t.Fatalf("Error setting up test for SQL: %v", err)
+		}
+		defer test.DeleteSQLDatabase(testSQLDriver, sourceAdmin, testSQLDatabaseName)
+	}
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	opts := GetDefaultOptions()
+	opts.NATSServerURL = "nats://127.0.0.1:4222"
+	opts.StoreType = stores.TypeSQL
+	opts.SQLStoreOpts.Driver = testSQLDriver
+	opts.SQLStoreOpts.Source = source
+	s := runServerWithOpts(t, opts, nil)
+	defer shutdownRestartedServerOnTestExit(&s)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	// Create a regular sub and a durable.
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {},
+		stan.SetManualAckMode(),
+		stan.MaxInflight(5000)); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	ch := make(chan bool, 1)
+	dur, err := sc.Subscribe("foo",
+		func(_ *stan.Msg) {
+			ch <- true
+		},
+		stan.SetManualAckMode(),
+		stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	// Publish a message
+	sc.Publish("foo", []byte("hello"))
+	if err := Wait(ch); err != nil {
+		t.Fatalf("Did not get our message")
+	}
+	dur.Close()
+	// Produce another message
+	sc.Publish("foo", []byte("hello"))
+
+	// Restart the server
+	s.Shutdown()
+	s = runServerWithOpts(t, opts, nil)
+	// Bombard the running subscriber with messages.
+	for i := 0; i < 3000; i++ {
+		sc.PublishAsync("foo", []byte("hello"), nil)
+	}
+	waitForAcks(t, s, clientName, 1, 3002)
+}
+
+func TestDeliveryRaceBetweenNextMsgAndStoring(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	prev := uint64(0)
+	errCh := make(chan error, 1)
+	doneCh := make(chan bool)
+	cb := func(m *stan.Msg) {
+		if m.Sequence != prev+1 {
+			errCh <- fmt.Errorf("Previous was %v, now got %v", prev, m.Sequence)
+			m.Sub.Close()
+			return
+		}
+		prev = m.Sequence
+		if m.Sequence == 4 {
+			doneCh <- true
+		}
+	}
+	if _, err := sc.Subscribe("foo", cb, stan.MaxInflight(1)); err != nil {
+		t.Fatalf("Erro on subscribe: %v", err)
+	}
+
+	sc.Publish("foo", []byte("msg1"))
+
+	ch1 := make(chan struct{})
+	ch2 := make(chan bool)
+	s.channels.Lock()
+	c := s.channels.channels["foo"]
+	c.store.Msgs = &blockingLookupStore{MsgStore: c.store.Msgs, inLookupCh: ch1, releaseCh: ch2}
+	s.channels.Unlock()
+
+	sub := s.clients.getSubs(clientName)[0]
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		s.sendAvailableMessages(c, sub)
+		wg.Done()
+	}()
+	<-ch1
+	sc.PublishAsync("foo", []byte("msg2"), nil)
+	sc.PublishAsync("foo", []byte("msg3"), nil)
+	time.Sleep(50 * time.Millisecond)
+	ch2 <- true
+	wg.Wait()
+
+	sc.Publish("foo", []byte("msg4"))
+
+	select {
+	case <-doneCh:
+	case e := <-errCh:
+		t.Fatal(e.Error())
+	case <-time.After(time.Second):
+		t.Fatal("Timeout!")
+	}
+}
+
+func TestDeliveryStopsWhenSubClosed(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+
+	// Use a bare NATS connection to send incorrect requests
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Unexpected error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Get the connect subject
+	connSubj := fmt.Sprintf("%s.%s", s.opts.DiscoverPrefix, clusterName)
+	connReq := &pb.ConnectRequest{
+		ClientID:       clientName,
+		HeartbeatInbox: nats.NewInbox(),
+	}
+	crb, _ := connReq.Marshal()
+	respMsg, err := nc.Request(connSubj, crb, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Request error: %v", err)
+	}
+	connResponse := &pb.ConnectResponse{}
+	connResponse.Unmarshal(respMsg.Data)
+
+	subSubj := connResponse.SubRequests
+	subCloseSubj := connResponse.SubCloseRequests
+
+	subReq := &pb.SubscriptionRequest{
+		ClientID:      clientName,
+		MaxInFlight:   1024,
+		Subject:       "foo",
+		StartPosition: pb.StartPosition_NewOnly,
+		AckWaitInSecs: 1,
+	}
+	subCloseReq := &pb.UnsubscribeRequest{
+		ClientID: clientName,
+		Subject:  "foo",
+	}
+
+	inbox := nats.NewInbox()
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		t.Fatalf("Unable to create nats subscriber: %v", err)
+	}
+	// Send a subscription request
+	subReq.Inbox = inbox
+	bytes, _ := subReq.Marshal()
+	msg, err := nc.Request(subSubj, bytes, time.Second)
+	if err != nil {
+		t.Fatalf("Error sending subscription request: %v", err)
+	}
+	// Parse the response
+	subReqResp := &pb.SubscriptionResponse{}
+	if err := subReqResp.Unmarshal(msg.Data); err != nil {
+		t.Fatalf(" Invalid subscription create response: %v", err)
+	}
+	if subReqResp.Error != "" {
+		t.Fatalf("Received response error: %q", subReqResp.Error)
+	}
+
+	ssub := s.clients.getSubs(clientName)[0]
+
+	// Close
+	subCloseReq.Inbox = subReqResp.AckInbox
+	bytes, _ = subCloseReq.Marshal()
+	msg, err = nc.Request(subCloseSubj, bytes, time.Second)
+	if err != nil {
+		t.Fatalf("Unable to sending unsub request: %v", err)
+	}
+	// Parse the response
+	subCloseResp := &pb.SubscriptionResponse{}
+	if err := subCloseResp.Unmarshal(msg.Data); err != nil {
+		t.Fatalf("Invalid subscription close response: %v", err)
+	}
+	if subCloseResp.Error != "" {
+		t.Fatalf("Error on close: %q", subCloseResp.Error)
+	}
+
+	// Now check that if the server was trying to send a message, the
+	// message would not be sent and ack timer not setup.
+	m := &pb.MsgProto{
+		Subject:   "foo",
+		Sequence:  1,
+		Data:      []byte("hello"),
+		Timestamp: time.Now().UnixNano(),
+	}
+	sent, sendMore := s.sendMsgToSub(ssub, m, false)
+	if sent || sendMore {
+		t.Fatalf("Should have returned false and false, but returned %v and %v", sent, sendMore)
+	}
+	// Expect to no receive anything on the sub
+	if msg, err := sub.NextMsg(100 * time.Millisecond); msg != nil || err == nil {
+		t.Fatalf("No message expected, got %+v", msg)
+	}
+	ssub.RLock()
+	timerSet := ssub.ackTimer != nil
+	ssub.RUnlock()
+	if timerSet {
+		t.Fatal("Ack timer should not be set, but it was")
 	}
 }
