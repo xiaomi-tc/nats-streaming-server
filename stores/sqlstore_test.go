@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"net"
 	"reflect"
 	"strings"
 	"sync"
@@ -24,12 +25,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/test"
+	"github.com/nats-io/stan.go/pb"
 
-	_ "github.com/go-sql-driver/mysql" // mysql driver
-	_ "github.com/lib/pq"              // postgres driver
+	mysql "github.com/go-sql-driver/mysql"                          // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
+	_ "github.com/nats-io/nats-streaming-server/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
 )
 
 // The SourceAdmin is used by the test setup to have access
@@ -1209,7 +1211,7 @@ func TestSQLSubStoreCachingAndRecovery(t *testing.T) {
 	acks := make(map[uint64]struct{})
 	acks[2] = struct{}{}
 	ackBytes, _ := sqlEncodeSeqs(acks, func(_ uint64) {})
-	stmt := "INSERT INTO SubsPending (subid, row, lastsent, pending, acks) VALUES (?, ?, ?, ?, ?)"
+	stmt := "INSERT INTO SubsPending (subid, `row`, lastsent, pending, acks) VALUES (?, ?, ?, ?, ?)"
 	if testSQLDriver == driverPostgres {
 		stmt = "INSERT INTO SubsPending (subid, row, lastsent, pending, acks) VALUES ($1, $2, $3, $4, $5)"
 	}
@@ -1237,6 +1239,73 @@ func TestSQLSubStoreCachingAndRecovery(t *testing.T) {
 	}
 	// Verify that rows have been removed on recovery.
 	testSQLCheckPendingRow(t, db, subID)
+}
+
+func TestSQLSubStoreSubsPendingNoDuplicateForRowID(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+	sqlMaxPendingAcks = 5
+	// "disable" timer based flusing for now
+	sqlSubStoreFlushInterval = time.Hour
+	defer func() {
+		sqlMaxPendingAcks = sqlDefaultMaxPendingAcks
+		sqlSubStoreFlushInterval = sqlDefaultSubStoreFlushInterval
+	}()
+
+	cleanupSQLDatastore(t)
+	defer cleanupSQLDatastore(t)
+
+	// Tests are by default not using caching, so this
+	// test has to be explicit.
+	s, err := NewSQLStore(testLogger, testSQLDriver, testSQLSource, nil, SQLNoCaching(false))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+	info := testDefaultServerInfo
+	if err := s.Init(&info); err != nil {
+		s.Close()
+		t.Fatalf("Error on Init: %v", err)
+	}
+
+	cname := "foo"
+
+	cs := storeCreateChannel(t, s, cname)
+	for i := uint64(1); i < 10; i++ {
+		storeMsg(t, cs, cname, i, []byte("hello"))
+	}
+
+	subID1 := storeSub(t, cs, cname)
+	subID2 := storeSub(t, cs, cname)
+
+	storeSubPending(t, cs, cname, subID1, 1)
+	storeSubFlush(t, cs, cname)
+
+	storeSubPending(t, cs, cname, subID2, 1)
+	storeSubFlush(t, cs, cname)
+
+	storeSubPending(t, cs, cname, subID1, 2)
+	storeSubFlush(t, cs, cname)
+
+	s.Close()
+	s, err = NewSQLStore(testLogger, testSQLDriver, testSQLSource, nil, SQLNoCaching(false))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+	state, err := s.Recover()
+	if err != nil {
+		t.Fatalf("Error recovering state: %v", err)
+	}
+	cs = getRecoveredChannel(t, state, cname)
+
+	// We have sub1 that has row 1 and 3, and sub2 that has row 2.
+	// We now cause sub1 to add a new row since we had up to the max.
+	// We want to make sure that we don't use "3" for the new row id
+	// but use a new one (otherwise there would be a duplicate entry
+	// "1-3" for primary key in subspending table).
+	storeSubPending(t, cs, cname, subID1, 3, 4, 5, 6, 7)
 }
 
 func TestSQLMaxConnections(t *testing.T) {
@@ -1751,4 +1820,323 @@ func TestSQLRecoverLastSeqAfterMessagesExpired(t *testing.T) {
 		t.Fatalf("Should be left with 6..5, got %v..%v", first, last)
 	}
 	s.Close()
+}
+
+func TestSQLMsgCacheAutoFlush(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+
+	sqlMsgCacheLimit = 100
+	defer func() { sqlMsgCacheLimit = sqlDefaultMsgCacheLimit }()
+
+	cleanupSQLDatastore(t)
+	defer cleanupSQLDatastore(t)
+
+	// Create a store with caching enabled (which is default, but invoke option here)
+	s, err := NewSQLStore(testLogger, testSQLDriver, testSQLSource, nil, SQLNoCaching(false))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	cs := storeCreateChannel(t, s, "foo")
+	total := sqlMsgCacheLimit + 10
+	payload := make([]byte, 100)
+	for i := 0; i < total; i++ {
+		storeMsg(t, cs, "foo", uint64(i+1), payload)
+	}
+	// Check that we have started to write messages into the DB.
+	db := getDBConnection(t)
+	defer db.Close()
+	r := db.QueryRow("SELECT COUNT(seq) FROM Messages")
+	count := 0
+	if err := r.Scan(&count); err != nil {
+		t.Fatalf("Error on scan: %v", err)
+	}
+	if count == 0 {
+		t.Fatalf("Expected some messages, got none")
+	}
+}
+
+func TestSQLGetExclusiveLockRace(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+
+	cleanupSQLDatastore(t)
+	defer cleanupSQLDatastore(t)
+
+	sqlLockUpdateInterval = 250 * time.Millisecond
+	sqlLockLostCount = 100
+	sqlNoPanic = true
+	defer func() {
+		sqlLockUpdateInterval = sqlDefaultLockUpdateInterval
+		sqlLockLostCount = sqlDefaultLockLostCount
+		sqlNoPanic = false
+	}()
+
+	s1 := createDefaultSQLStore(t)
+	defer s1.Close()
+
+	hasLock, err := s1.GetExclusiveLock()
+	if !hasLock || err != nil {
+		t.Fatalf("Expected lock to be acquired, got %v, %v", hasLock, err)
+	}
+
+	dl := &captureErrAndFatalLogger{}
+	s2, err := NewSQLStore(dl, testSQLDriver, testSQLSource, nil, SQLNoCaching(true))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s2.Close()
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		s2.GetExclusiveLock()
+		wg.Done()
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	s1.Close()
+
+	wg.Wait()
+
+	db := getDBConnection(t)
+	defer db.Close()
+
+	// Now check that s2's is updating the lock table
+	prevTick := uint64(0)
+	for i := 0; i < 2; i++ {
+		r := db.QueryRow("SELECT tick FROM StoreLock")
+		tick := uint64(0)
+		if err := r.Scan(&tick); err != nil {
+			t.Fatalf("Error on Scan: %v", err)
+		}
+		if prevTick > 0 && tick == prevTick {
+			t.Fatalf("Tick was not updated (%v)", prevTick)
+		}
+		prevTick = tick
+		if i == 0 {
+			time.Sleep(3 * sqlLockUpdateInterval)
+		}
+	}
+}
+
+type myProxy struct {
+	sync.Mutex
+	connectTo string
+	port      int
+	l         net.Listener
+	pauseCh   chan struct{}
+	wg        sync.WaitGroup
+}
+
+func newProxy(connectTo string) (*myProxy, error) {
+	p := &myProxy{connectTo: connectTo, pauseCh: make(chan struct{}, 1)}
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	p.l = l
+	p.port = l.Addr().(*net.TCPAddr).Port
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			p.wg.Add(1)
+			go p.proxy(c)
+		}
+	}()
+	return p, nil
+}
+
+func (p *myProxy) proxy(c net.Conn) {
+	defer p.wg.Done()
+
+	dest, err := net.Dial("tcp", p.connectTo)
+	if err != nil {
+		p.l.Close()
+		return
+	}
+
+	pauseIfAsked := func() {
+		select {
+		case <-p.pauseCh:
+			// We were paused.. wait for other notification to unpause
+			<-p.pauseCh
+		default:
+		}
+	}
+
+	go func() {
+		defer dest.Close()
+		var destBuf [1024]byte
+		for {
+			n, err := dest.Read(destBuf[:])
+			if err != nil {
+				return
+			}
+			pauseIfAsked()
+			if _, err := c.Write(destBuf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+
+	defer dest.Close()
+	defer c.Close()
+	var buf [1024]byte
+	for {
+		n, err := c.Read(buf[:])
+		if err != nil {
+			return
+		}
+		pauseIfAsked()
+		if _, err := dest.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+func (p *myProxy) getPort() int {
+	return p.port
+}
+
+func (p *myProxy) pause() {
+	p.pauseCh <- struct{}{}
+}
+
+func (p *myProxy) resume() {
+	p.pauseCh <- struct{}{}
+}
+
+func (p *myProxy) close() {
+	p.l.Close()
+	p.wg.Wait()
+}
+
+type silenceMySQLLogger struct{}
+
+func (l *silenceMySQLLogger) Print(v ...interface{}) {}
+
+func TestSQLDeadlines(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+
+	cleanupSQLDatastore(t)
+	defer cleanupSQLDatastore(t)
+
+	var port int
+	var source string
+
+	if testSQLDriver == driverMySQL {
+		port = 3306
+	} else {
+		port = 5432
+	}
+	proxy, err := newProxy(fmt.Sprintf("localhost:%d", port))
+	if err != nil {
+		t.Fatalf("Error creating proxy: %v", err)
+	}
+	defer proxy.close()
+
+	pport := proxy.getPort()
+	if testSQLDriver == driverMySQL {
+		source = fmt.Sprintf("nss:password@tcp(localhost:%d)/%s?readTimeout=500ms&writeTimeout=500ms", pport, testDefaultDatabaseName)
+		mysql.SetLogger(&silenceMySQLLogger{})
+	} else {
+		source = fmt.Sprintf("port=%d dbname=%s readTimeout=500ms writeTimeout=500ms sslmode=disable", pport, testDefaultDatabaseName)
+	}
+	s, err := NewSQLStore(testLogger, testSQLDriver, source, nil, SQLNoCaching(true), SQLMaxOpenConns(1))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	c := storeCreateChannel(t, s, "foo")
+	storeMsg(t, c, "foo", 1, []byte("msg1"))
+
+	checkTimeout := func(t *testing.T, f func() error) {
+		proxy.pause()
+		defer proxy.resume()
+
+		start := time.Now()
+		if err := f(); err == nil {
+			t.Fatal("Expected error, did not get one")
+		}
+		dur := time.Since(start)
+		if dur > time.Second {
+			t.Fatalf("Expected to take less than 1sec, took: %v", dur)
+		}
+	}
+
+	checkTimeout(t, func() error {
+		_, err := c.Msgs.Store(&pb.MsgProto{
+			Sequence:  2,
+			Data:      []byte("msg2"),
+			Subject:   "foo",
+			Timestamp: time.Now().UnixNano(),
+		})
+		return err
+	})
+
+	msgStoreLookup(t, c.Msgs, 1)
+
+	checkTimeout(t, func() error {
+		_, err := c.Msgs.Lookup(1)
+		return err
+	})
+}
+
+func TestSQLMaxAgeForMsgsWithTimestampInPast(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+
+	cleanupSQLDatastore(t)
+	defer cleanupSQLDatastore(t)
+
+	// Create store with caching enabled (the no cache is handled in
+	// test TestCSMaxAgeForMsgsWithTimestampInPast).
+	s, err := NewSQLStore(testLogger, testSQLDriver, testSQLSource, nil, SQLNoCaching(false))
+	if err != nil {
+		t.Fatalf("Error creating store: %v", err)
+	}
+	defer s.Close()
+
+	sl := testDefaultStoreLimits
+	sl.MaxAge = time.Minute
+	s.SetLimits(&sl)
+
+	cs := storeCreateChannel(t, s, "foo")
+	for seq := uint64(1); seq < 3; seq++ {
+		// Create a message with a timestamp in the past.
+		msg := &pb.MsgProto{
+			Sequence:  seq,
+			Subject:   "foo",
+			Data:      []byte("hello"),
+			Timestamp: time.Now().Add(-time.Hour).UnixNano(),
+		}
+		if _, err := cs.Msgs.Store(msg); err != nil {
+			t.Fatalf("Error storing message: %v", err)
+		}
+		// With caching, timer is triggered on Flush().
+		if err := cs.Msgs.Flush(); err != nil {
+			t.Fatalf("Error on flush: %v", err)
+		}
+		// Wait a bit
+		time.Sleep(300 * time.Millisecond)
+		// Check that message has expired.
+		if first, err := cs.Msgs.FirstSequence(); err != nil || first != seq+1 {
+			t.Fatal("Message should have expired")
+		}
+	}
 }

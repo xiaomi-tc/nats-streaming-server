@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,10 +19,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	natsdLogger "github.com/nats-io/gnatsd/logger"
+	natsdLogger "github.com/nats-io/nats-server/v2/logger"
 )
 
 func TestMain(m *testing.M) {
@@ -176,10 +177,15 @@ func TestLogger(t *testing.T) {
 	checkLogger("Unable to close logger: dummy error")
 
 	// Switch to file log
-	fname := "test.log"
-	defer os.Remove(fname)
+	tmpDir, err := ioutil.TempDir("", "")
+	if err != nil {
+		t.Fatalf("Unable to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	fname := filepath.Join(tmpDir, "test.log")
 	fl := natsdLogger.NewFileLogger(fname, true, true, true, true)
 	logger.SetLogger(fl, true, true, true, fname)
+	logger.SetFileSizeLimit(1000)
 	// Reopen and check file content
 	logger.ReopenLogFile()
 	buf, err := ioutil.ReadFile(fname)
@@ -189,6 +195,18 @@ func TestLogger(t *testing.T) {
 	expectedStr := "File log re-opened"
 	if !strings.Contains(string(buf), expectedStr) {
 		t.Fatalf("Expected log to contain %q, got %q", expectedStr, string(buf))
+	}
+	// Make sure that the file size limit was applied to the new file
+	notice := "This is some notice..."
+	for i := 0; i < 100; i++ {
+		logger.Noticef(notice)
+	}
+	files, err := ioutil.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("Unable to read temp dir: %v", err)
+	}
+	if len(files) == 1 {
+		t.Fatalf("Size limit was not applied")
 	}
 	logger.Close()
 	if err := os.Remove(fname); err != nil {

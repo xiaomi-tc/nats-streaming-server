@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"os"
@@ -25,12 +26,12 @@ import (
 	"testing"
 	"time"
 
-	natsd "github.com/nats-io/gnatsd/server"
-	natsdTest "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
+	natsd "github.com/nats-io/nats-server/v2/server"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
 )
 
 func TestRunServer(t *testing.T) {
@@ -358,6 +359,7 @@ func TestTLSSuccessSecure(t *testing.T) {
 	sOpts := GetDefaultOptions()
 	sOpts.ID = clusterName
 	sOpts.Secure = true
+	sOpts.ClientCA = "../test/certs/ca.pem"
 
 	s := runServerWithOpts(t, sOpts, &nOpts)
 	defer s.Shutdown()
@@ -372,6 +374,7 @@ func TestTLSSwitchAutomatically(t *testing.T) {
 
 	sOpts := GetDefaultOptions()
 	sOpts.ID = clusterName
+	sOpts.ClientCA = "../test/certs/ca.pem"
 
 	s, err := RunServerWithOpts(sOpts, &nOpts)
 	if err != nil {
@@ -395,6 +398,109 @@ func TestTLSFailClientTLSServerPlain(t *testing.T) {
 		t.Fatal("Expected server to fail to start, it did not")
 	}
 }
+
+func TestTLSServerNameAndSkipVerify(t *testing.T) {
+	nOpts := DefaultNatsServerOptions
+
+	nOpts.Host = "0.0.0.0"
+	nOpts.TLSCert = "../test/certs/server-noip.pem"
+	nOpts.TLSKey = "../test/certs/server-key-noip.pem"
+	nOpts.TLSCaCert = "../test/certs/ca.pem"
+
+	sOpts := GetDefaultOptions()
+	sOpts.ClientCert = "../test/certs/client-cert.pem"
+	sOpts.ClientKey = "../test/certs/client-key.pem"
+	sOpts.ClientCA = "../test/certs/ca.pem"
+
+	s, err := RunServerWithOpts(sOpts, &nOpts)
+	if s != nil || err == nil {
+		s.Shutdown()
+		t.Fatal("Expected server to fail to start, it did not")
+	}
+
+	sOpts.TLSServerName = "localhost"
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Expected server to start ok, got %v", err)
+	}
+	s.Shutdown()
+	s = nil
+
+	sOpts.TLSServerName = ""
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if s != nil || err == nil {
+		s.Shutdown()
+		t.Fatal("Expected server to fail to start, it did not")
+	}
+
+	sOpts.TLSSkipVerify = true
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Expected server to start ok, got %v", err)
+	}
+	s.Shutdown()
+
+	// With insecure, all client cert/key/ca can be removed
+	// and connections should still succeed
+	sOpts.ClientCert, sOpts.ClientKey, sOpts.ClientCA = "", "", ""
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Expected server to start ok, got %v", err)
+	}
+	s.Shutdown()
+
+	// However, it should fail if NATS Server requires client cert verification
+	nOpts.TLSVerify = true
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if s != nil || err == nil {
+		s.Shutdown()
+		t.Fatal("Expected server to fail to start, it did not")
+	}
+}
+
+func TestTLSServerNameAndSkipVerifyConflicts(t *testing.T) {
+	nOpts := DefaultNatsServerOptions
+
+	nOpts.Host = "0.0.0.0"
+	nOpts.TLSCert = "../test/certs/server-noip.pem"
+	nOpts.TLSKey = "../test/certs/server-key-noip.pem"
+	nOpts.TLSCaCert = "../test/certs/ca.pem"
+
+	sOpts := GetDefaultOptions()
+	sOpts.NATSClientOpts = []nats.Option{nats.Secure(&tls.Config{ServerName: "localhost"})}
+	sOpts.ClientCert = "../test/certs/client-cert.pem"
+	sOpts.ClientKey = "../test/certs/client-key.pem"
+	sOpts.ClientCA = "../test/certs/ca.pem"
+	sOpts.TLSServerName = "confict"
+
+	s, err := RunServerWithOpts(sOpts, &nOpts)
+	if s != nil || err == nil {
+		s.Shutdown()
+		t.Fatal("Expected server to fail to start, it did not")
+	}
+	if !strings.Contains(err.Error(), "conflict between") {
+		t.Fatalf("Error should indicate conflict, got %v", err)
+	}
+	sOpts.TLSServerName = ""
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Unable to start server: %v", err)
+	}
+	s.Shutdown()
+
+	// Pass skip verify as a NATS option
+	sOpts.NATSClientOpts = []nats.Option{nats.Secure(&tls.Config{InsecureSkipVerify: true})}
+	// Use the wrong name for streaming TLSServerName
+	sOpts.TLSServerName = "wrong"
+	// And make sure that NATS Option skip veriy is not overridden with that..
+	sOpts.TLSSkipVerify = false
+	s, err = RunServerWithOpts(sOpts, &nOpts)
+	if err != nil {
+		t.Fatalf("Unable to start server: %v", err)
+	}
+	s.Shutdown()
+}
+
 func TestDontEmbedNATSNotRunning(t *testing.T) {
 	sOpts := GetDefaultOptions()
 	// Make sure that with empty string (normally the default), we
@@ -420,7 +526,7 @@ func TestDontEmbedNATSRunning(t *testing.T) {
 	sOpts.NATSServerURL = "nats://localhost:5223"
 
 	nOpts := DefaultNatsServerOptions
-	nOpts.Host = "localhost"
+	nOpts.Host = "127.0.0.1"
 	nOpts.Port = 5223
 	natsd := natsdTest.RunServer(&nOpts)
 	defer natsd.Shutdown()
@@ -484,20 +590,33 @@ func TestPersistentStoreNoPanicOnShutdown(t *testing.T) {
 	defer s.Shutdown()
 
 	// Start a go routine that keeps sending messages
-	sendQuit := make(chan bool)
+	sendQuit := make(chan bool, 1)
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
+	nc, err := nats.Connect(nats.DefaultURL, nats.NoReconnect())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+	sc, err := stan.Connect(clusterName, clientName,
+		stan.NatsConn(nc),
+		stan.PubAckWait(250*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer sc.Close()
 	go func() {
 		defer wg.Done()
-
-		sc, nc := createConnectionWithNatsOpts(t, clientName, nats.NoReconnect())
-		defer sc.Close()
-		defer nc.Close()
-
 		payload := []byte("hello")
 		for {
 			select {
 			case <-sendQuit:
+				// We know that the server is shutdown, so close
+				// the NATS connection first so that STAN does not
+				// try to send the close protocol (which will timeout
+				// with a 2sec by default).
+				nc.Close()
+				sc.Close()
 				return
 			default:
 				sc.PublishAsync("foo", payload, nil)
@@ -900,6 +1019,7 @@ func TestGhostDurableSubs(t *testing.T) {
 	waitForNumClients(t, s, 0)
 
 	// Change store to simulate no flush on simulated crash
+	orgStore := s.store
 	s.store = &storeNoClose{Store: s.store}
 	s.Shutdown()
 
@@ -908,6 +1028,7 @@ func TestGhostDurableSubs(t *testing.T) {
 	check(false)
 
 	sc.Close()
+	orgStore.Close()
 }
 
 func TestGetNATSOptions(t *testing.T) {
@@ -1059,4 +1180,97 @@ func TestDontExposeUserPassword(t *testing.T) {
 	if !strings.Contains(msg, "nats://[REDACTED]@localhost:") {
 		t.Fatalf("Password exposed in url: %v", msg)
 	}
+}
+
+func TestStreamingServerReadyLog(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	checkLog := func(t *testing.T, l *captureNoticesLogger, expected bool) {
+		t.Helper()
+		check := func() error {
+			present := false
+			l.Lock()
+			for _, n := range l.notices {
+				if strings.Contains(n, streamingReadyLog) {
+					present = true
+					break
+				}
+			}
+			l.Unlock()
+			if !expected && present {
+				return fmt.Errorf("Did not expect the log statement at this time")
+			} else if expected && !present {
+				return fmt.Errorf("Log statement still not present")
+			}
+			return nil
+		}
+		// When not expected, wait a bit to make sure that the
+		// statement does not show up.
+		if !expected {
+			time.Sleep(500 * time.Millisecond)
+			if err := check(); err != nil {
+				t.Fatal(err.Error())
+			}
+		} else {
+			waitFor(t, time.Second, 15*time.Millisecond, func() error {
+				return check()
+			})
+		}
+	}
+
+	// Standalone case
+	sOpts := GetDefaultOptions()
+	l := &captureNoticesLogger{}
+	sOpts.CustomLogger = l
+	sOpts.NATSServerURL = "nats://localhost:4222"
+	s := runServerWithOpts(t, sOpts, nil)
+	defer s.Shutdown()
+	checkLog(t, l, true)
+	s.Shutdown()
+
+	// FT case..
+	sOpts = getTestFTDefaultOptions()
+	l = &captureNoticesLogger{}
+	sOpts.CustomLogger = l
+	sOpts.NATSServerURL = "nats://localhost:4222"
+	s = runServerWithOpts(t, sOpts, nil)
+	defer s.Shutdown()
+	checkLog(t, l, true)
+
+	sOpts = getTestFTDefaultOptions()
+	l2 := &captureNoticesLogger{}
+	sOpts.CustomLogger = l2
+	sOpts.NATSServerURL = "nats://localhost:4222"
+	s2 := runServerWithOpts(t, sOpts, nil)
+	defer s2.Shutdown()
+	// At first, we should not get the lock since server
+	// is standby...
+	checkLog(t, l2, false)
+	// Now shutdown s and s2 should report it is ready
+	s.Shutdown()
+	checkLog(t, l2, true)
+	s2.Shutdown()
+
+	// Clustering case..
+	sOpts = getTestDefaultOptsForClustering("a", false)
+	sOpts.Clustering.Peers = []string{"b"}
+	l = &captureNoticesLogger{}
+	sOpts.CustomLogger = l
+	s = runServerWithOpts(t, sOpts, nil)
+	defer s.Shutdown()
+	checkLog(t, l, false)
+
+	sOpts = getTestDefaultOptsForClustering("b", false)
+	sOpts.Clustering.Peers = []string{"a"}
+	s2 = runServerWithOpts(t, sOpts, nil)
+	defer s2.Shutdown()
+
+	getLeader(t, 5*time.Second, s, s2)
+	checkLog(t, l, true)
 }

@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,17 +27,18 @@ import (
 	"testing"
 	"time"
 
-	natsd "github.com/nats-io/gnatsd/server"
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	natsd "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/stores"
 	"github.com/nats-io/nats-streaming-server/test"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 
-	_ "github.com/go-sql-driver/mysql" // mysql driver
-	_ "github.com/lib/pq"              // postgres driver
+	_ "github.com/go-sql-driver/mysql"                              // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
+	_ "github.com/nats-io/nats-streaming-server/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
 )
 
 const (
@@ -81,13 +82,13 @@ var (
 	testSQLSourceAdmin  = testDefaultMySQLSourceAdmin
 	testSQLDatabaseName = testDefaultDatabaseName
 	testDBSuffixes      = []string{"", "_a", "_b", "_c"}
+	doSQL               = false
 )
 
 func TestMain(m *testing.M) {
 	var (
 		bst         string
 		pst         string
-		doSQL       bool
 		sqlCreateDb bool
 		sqlDeleteDb bool
 	)
@@ -185,6 +186,8 @@ func init() {
 func stackFatalf(t tLogger, f string, args ...interface{}) {
 	msg := fmt.Sprintf(f, args...) + "\n" + stack()
 	t.Fatalf(msg)
+	// For staticcheck SA0511...
+	panic("unreachable code")
 }
 
 func stack() string {
@@ -357,20 +360,23 @@ func waitForNumSubs(t tLogger, s *StanServer, ID string, expected int) {
 }
 
 func waitForAcks(t tLogger, s *StanServer, ID string, subID uint64, expected int) {
-	subs := s.clients.getSubs(ID)
 	var sub *subState
-	for _, s := range subs {
-		s.RLock()
-		sID := s.ID
-		s.RUnlock()
-		if sID == subID {
-			sub = s
-			break
+	waitFor(t, 5*time.Second, 15*time.Millisecond, func() error {
+		subs := s.clients.getSubs(ID)
+		for _, s := range subs {
+			s.RLock()
+			sID := s.ID
+			s.RUnlock()
+			if sID == subID {
+				sub = s
+				break
+			}
 		}
-	}
-	if sub == nil {
-		stackFatalf(t, "Subscription %v not found", subID)
-	}
+		if sub == nil {
+			return fmt.Errorf("Subscription %v not found", subID)
+		}
+		return nil
+	})
 	waitForCount(t, expected, func() (string, int) {
 		sub.RLock()
 		count := len(sub.acksPending)
@@ -428,6 +434,10 @@ func getTestDefaultOptsForPersistentStore() *Options {
 	case stores.TypeFile:
 		opts.FilestoreDir = defaultDataStore
 		opts.FileStoreOpts.BufferSize = 1024
+		// Go 1.12 on macOS is very slow at doing sync writes...
+		if runtime.GOOS == "darwin" && strings.HasPrefix(runtime.Version(), "go1.12") {
+			opts.FileStoreOpts.DoSync = false
+		}
 	case stores.TypeSQL:
 		opts.SQLStoreOpts.Driver = testSQLDriver
 		opts.SQLStoreOpts.Source = testSQLSource
@@ -1114,10 +1124,12 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
+	defer nc.Close()
 	sc, err := stan.Connect(clusterName, clientName, stan.NatsConn(nc))
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
+	defer sc.Close()
 	// Since server is expected to crash, do not attempt to close sc
 	// because it would delay test by 2 seconds.
 
@@ -1138,8 +1150,8 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 
 	m := &pb.MsgProto{}
 	sub.Lock()
+	defer sub.Unlock()
 	s.sendMsgToSub(sub, m, false)
-	sub.Unlock()
 }
 
 func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
@@ -1168,7 +1180,7 @@ func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
 	connResponse.Unmarshal(respMsg.Data)
 
 	subSubj := connResponse.SubRequests
-	unsubSubj := connResponse.UnsubRequests
+	subCloseSubj := connResponse.SubCloseRequests
 	pubSubj := connResponse.PubPrefix + ".foo"
 
 	pubMsg := &pb.PubMsg{
@@ -1180,53 +1192,94 @@ func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
 		ClientID:      clientName,
 		MaxInFlight:   1024,
 		Subject:       "foo",
-		StartPosition: pb.StartPosition_First,
-		AckWaitInSecs: 30,
+		StartPosition: pb.StartPosition_NewOnly,
+		AckWaitInSecs: 1,
 	}
-	unsubReq := &pb.UnsubscribeRequest{
+	subCloseReq := &pb.UnsubscribeRequest{
 		ClientID: clientName,
 		Subject:  "foo",
 	}
-	for i := 0; i < 100; i++ {
-		// Use the same subscriber for subscription request response and data,
-		// so we can reliably check if data comes before response.
-		inbox := nats.NewInbox()
-		sub, err := nc.SubscribeSync(inbox)
-		if err != nil {
-			t.Fatalf("Unable to create nats subscriber: %v", err)
+	tsubQueueName := []string{"", "queue"}
+	tsubDurName := []string{"", "dur"}
+	for _, qname := range tsubQueueName {
+		for _, dname := range tsubDurName {
+			for i := 0; i < 2; i++ {
+				// Use the same subscriber for subscription request response and data,
+				// so we can reliably check if data comes before response.
+				inbox := nats.NewInbox()
+				sub, err := nc.SubscribeSync(inbox)
+				if err != nil {
+					t.Fatalf("Unable to create nats subscriber: %v", err)
+				}
+				subReq.Inbox = inbox
+				subReq.QGroup = qname
+				subReq.DurableName = dname
+				bytes, _ := subReq.Marshal()
+				// Send the request with inbox as the Reply
+				if err := nc.PublishRequest(subSubj, inbox, bytes); err != nil {
+					t.Fatalf("Error sending request: %v", err)
+				}
+				// Followed by a data message
+				pubMsg.Guid = nuid.Next()
+				bytes, _ = pubMsg.Marshal()
+				if err := nc.Publish(pubSubj, bytes); err != nil {
+					t.Fatalf("Error sending msg: %v", err)
+				}
+				nc.Flush()
+				// Dequeue
+				msg, err := sub.NextMsg(2 * time.Second)
+				if err != nil {
+					t.Fatalf("Did not get our message: %v", err)
+				}
+				// It should always be the subscription response!!!
+				msgProto := &pb.MsgProto{}
+				err = msgProto.Unmarshal(msg.Data)
+				if err == nil && msgProto.Sequence != 0 {
+					t.Fatalf("Queue %q - Durable %q - Invalid subscription create response: %#v - %v",
+						qname, dname, msgProto, err)
+				}
+				subReqResp := &pb.SubscriptionResponse{}
+				if err := subReqResp.Unmarshal(msg.Data); err != nil {
+					t.Fatalf("Queue %q - Durable %q - Invalid subscription create response: %v",
+						qname, dname, err)
+				}
+				if subReqResp.Error != "" {
+					t.Fatalf("Received response error: %q", subReqResp.Error)
+				}
+				// If the message arrived just before the
+				// subscription request, and since we ask for
+				// new-only, it is possible that there is no
+				// message. Asking for all avail is not good for
+				// this test since - for durables - it would test
+				// the newOnHold more than the initialized flag.
+				msg, err = sub.NextMsg(time.Second)
+				if err == nil {
+					if err := msgProto.Unmarshal(msg.Data); err != nil {
+						t.Fatalf("Invalid message: %v", err)
+					}
+					ackReq := &pb.Ack{
+						Sequence: msgProto.Sequence,
+						Subject:  msgProto.Subject,
+					}
+					bytes, _ = ackReq.Marshal()
+					nc.Publish(subReqResp.AckInbox, bytes)
+				}
+				subCloseReq.Inbox = subReqResp.AckInbox
+				bytes, _ = subCloseReq.Marshal()
+				msg, err = nc.Request(subCloseSubj, bytes, 2*time.Second)
+				if err != nil {
+					t.Fatalf("Unable to send unsub request: %v", err)
+				}
+				subCloseResp := &pb.SubscriptionResponse{}
+				if err := subCloseResp.Unmarshal(msg.Data); err != nil {
+					t.Fatalf("Invalid subscription close response: %v", err)
+				}
+				if subCloseResp.Error != "" {
+					t.Fatalf("Error on close: %q", subCloseResp.Error)
+				}
+				sub.Unsubscribe()
+			}
 		}
-		subReq.Inbox = inbox
-		bytes, _ := subReq.Marshal()
-		// Send the request with inbox as the Reply
-		if err := nc.PublishRequest(subSubj, inbox, bytes); err != nil {
-			t.Fatalf("Error sending request: %v", err)
-		}
-		// Followed by a data message
-		pubMsg.Guid = nuid.Next()
-		bytes, _ = pubMsg.Marshal()
-		if err := nc.Publish(pubSubj, bytes); err != nil {
-			t.Fatalf("Error sending msg: %v", err)
-		}
-		nc.Flush()
-		// Dequeue
-		msg, err := sub.NextMsg(2 * time.Second)
-		if err != nil {
-			t.Fatalf("Did not get our message: %v", err)
-		}
-		// It should always be the subscription response!!!
-		msgProto := &pb.MsgProto{}
-		err = msgProto.Unmarshal(msg.Data)
-		if err == nil && msgProto.Sequence != 0 {
-			t.Fatalf("Iter=%v - Did not receive valid subscription response: %#v - %v", (i + 1), msgProto, err)
-		}
-		subReqResp := &pb.SubscriptionResponse{}
-		subReqResp.Unmarshal(msg.Data)
-		unsubReq.Inbox = subReqResp.AckInbox
-		bytes, _ = unsubReq.Marshal()
-		if err := nc.Publish(unsubSubj, bytes); err != nil {
-			t.Fatalf("Unable to send unsub request: %v", err)
-		}
-		sub.Unsubscribe()
 	}
 }
 

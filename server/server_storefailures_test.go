@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 type mockedStore struct {
@@ -41,6 +41,7 @@ type mockedSubStore struct {
 	sync.RWMutex
 	fail          bool
 	failFlushOnce bool
+	ch            chan bool
 }
 
 func (ms *mockedStore) CreateChannel(name string) (*stores.Channel, error) {
@@ -250,6 +251,21 @@ func TestMsgLookupFailures(t *testing.T) {
 	sub.Unsubscribe()
 }
 
+func (ss *mockedSubStore) CreateSub(sub *spb.SubState) error {
+	ss.RLock()
+	fail := ss.fail
+	ch := ss.ch
+	ss.RUnlock()
+	if ch != nil {
+		// Wait for notification that we can continue
+		<-ch
+	}
+	if fail {
+		return fmt.Errorf("On purpose")
+	}
+	return ss.SubStore.CreateSub(sub)
+}
+
 func (ss *mockedSubStore) AddSeqPending(subid, seq uint64) error {
 	ss.RLock()
 	fail := ss.fail
@@ -328,6 +344,9 @@ func TestDeleteSubFailures(t *testing.T) {
 	// Produce a message to this durable queue sub
 	if err := sc.Publish("foo", []byte("hello")); err != nil {
 		t.Fatalf("Error on publish: %v", err)
+	}
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our message")
 	}
 	// Create 2 more durable queue subs
 	dqsub2, err := sc.QueueSubscribe("foo", "dqueue", func(_ *stan.Msg) {},

@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	natsd "github.com/nats-io/gnatsd/server"
-	natsdTest "github.com/nats-io/gnatsd/test"
+	natsd "github.com/nats-io/nats-server/v2/server"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 )
 
 func TestSignalIgnoreUnknown(t *testing.T) {
@@ -59,7 +59,7 @@ func TestSignalToReOpenLogFile(t *testing.T) {
 		sopts := GetDefaultOptions()
 		sopts.HandleSignals = true
 		nopts := &natsd.Options{
-			Host:    "localhost",
+			Host:    "127.0.0.1",
 			Port:    -1,
 			NoSigs:  true,
 			LogFile: logFile,
@@ -131,7 +131,7 @@ func (sc *stderrCatcher) Write(p []byte) (n int, err error) {
 }
 
 func TestSignalTrapsSIGTERM(t *testing.T) {
-	// This test requires that the
+	// This test requires that the server be installed.
 	cmd := exec.Command("nats-streaming-server")
 	sc := &stderrCatcher{}
 	cmd.Stderr = sc
@@ -144,7 +144,7 @@ func TestSignalTrapsSIGTERM(t *testing.T) {
 		if ready {
 			return nil
 		}
-		return fmt.Errorf("process not started yet")
+		return fmt.Errorf("process not started yet, make sure you `go install` first!")
 	})
 	syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
 	cmd.Wait()

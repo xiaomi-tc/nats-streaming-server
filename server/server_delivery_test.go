@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,14 +15,17 @@ package server
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats-streaming"
-	"github.com/nats-io/go-nats-streaming/pb"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats-streaming-server/test"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func testStalledDelivery(t *testing.T, typeSub string) {
@@ -251,5 +254,131 @@ func TestDeliveryWithGapsInSequence(t *testing.T) {
 	case e := <-errCh:
 		t.Fatalf(e.Error())
 	default:
+	}
+}
+
+func TestPersistentStoreSQLSubsPendingRows(t *testing.T) {
+	if !doSQL {
+		t.SkipNow()
+	}
+	source := testSQLSource
+	if persistentStoreType != stores.TypeSQL {
+		// If not running tests with `-persistent_store sql`,
+		// initialize few things and default to MySQL.
+		source = testDefaultMySQLSource
+		sourceAdmin := testDefaultMySQLSourceAdmin
+		if err := test.CreateSQLDatabase(testSQLDriver, sourceAdmin,
+			source, testSQLDatabaseName); err != nil {
+			t.Fatalf("Error setting up test for SQL: %v", err)
+		}
+		defer test.DeleteSQLDatabase(testSQLDriver, sourceAdmin, testSQLDatabaseName)
+	}
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	ns := natsdTest.RunDefaultServer()
+	defer ns.Shutdown()
+
+	opts := GetDefaultOptions()
+	opts.NATSServerURL = "nats://localhost:4222"
+	opts.StoreType = stores.TypeSQL
+	opts.SQLStoreOpts.Driver = testSQLDriver
+	opts.SQLStoreOpts.Source = source
+	s := runServerWithOpts(t, opts, nil)
+	defer shutdownRestartedServerOnTestExit(&s)
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	// Create a regular sub and a durable.
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {},
+		stan.SetManualAckMode(),
+		stan.MaxInflight(5000)); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	ch := make(chan bool, 1)
+	dur, err := sc.Subscribe("foo",
+		func(_ *stan.Msg) {
+			ch <- true
+		},
+		stan.SetManualAckMode(),
+		stan.DurableName("dur"))
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	// Publish a message
+	sc.Publish("foo", []byte("hello"))
+	if err := Wait(ch); err != nil {
+		t.Fatalf("Did not get our message")
+	}
+	dur.Close()
+	// Produce another message
+	sc.Publish("foo", []byte("hello"))
+
+	// Restart the server
+	s.Shutdown()
+	s = runServerWithOpts(t, opts, nil)
+	// Bombard the running subscriber with messages.
+	for i := 0; i < 3000; i++ {
+		sc.PublishAsync("foo", []byte("hello"), nil)
+	}
+	waitForAcks(t, s, clientName, 1, 3002)
+}
+
+func TestDeliveryRaceBetweenNextMsgAndStoring(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	prev := uint64(0)
+	errCh := make(chan error, 1)
+	doneCh := make(chan bool)
+	cb := func(m *stan.Msg) {
+		if m.Sequence != prev+1 {
+			errCh <- fmt.Errorf("Previous was %v, now got %v", prev, m.Sequence)
+			m.Sub.Close()
+			return
+		}
+		prev = m.Sequence
+		if m.Sequence == 4 {
+			doneCh <- true
+		}
+	}
+	if _, err := sc.Subscribe("foo", cb, stan.MaxInflight(1)); err != nil {
+		t.Fatalf("Erro on subscribe: %v", err)
+	}
+
+	sc.Publish("foo", []byte("msg1"))
+
+	c := s.channels.get("foo")
+	ch1 := make(chan struct{})
+	ch2 := make(chan bool)
+	c.store.Msgs = &blockingLookupStore{MsgStore: c.store.Msgs, inLookupCh: ch1, releaseCh: ch2}
+
+	sub := s.clients.getSubs(clientName)[0]
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		s.sendAvailableMessages(c, sub)
+		wg.Done()
+	}()
+	<-ch1
+	sc.PublishAsync("foo", []byte("msg2"), nil)
+	sc.PublishAsync("foo", []byte("msg3"), nil)
+	time.Sleep(50 * time.Millisecond)
+	ch2 <- true
+	wg.Wait()
+
+	sc.Publish("foo", []byte("msg4"))
+
+	select {
+	case <-doneCh:
+	case e := <-errCh:
+		t.Fatal(e.Error())
+	case <-time.After(time.Second):
+		t.Fatal("Timeout!")
 	}
 }

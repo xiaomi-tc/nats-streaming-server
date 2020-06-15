@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,7 +20,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	natsd "github.com/nats-io/gnatsd/server"
+	natsd "github.com/nats-io/nats-server/v2/server"
 )
 
 func init() {
@@ -36,26 +36,38 @@ func (s *StanServer) handleSignals() {
     //signal.Notify(c, syscall.SIGINT, syscall.SIGUSR1)
     signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGQUIT, syscall.SIGHUP,syscall.SIGUSR1)
 	go func() {
-		for sig := range c {
-			// Notify will relay only the signals that we have
-			// registered, so we don't need a "default" in the
-			// switch statement.
-			switch sig {
-			case syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT:
-                //2018-06-13
-                s.log.Noticef("get signal:%v, will UnRegister()", sig)
-                s.opts.ConsulUtil.UnRegister()
+		for {
+			select {
+			case sig := <-c:
+				// Notify will relay only the signals that we have
+				// registered, so we don't need a "default" in the
+				// switch statement.
+				switch sig {
+				case syscall.SIGINT, syscall.SIGKILL, syscall.SIGQUIT:
+					//2018-06-13
+					s.log.Noticef("get signal:%v, will UnRegister()", sig)
+					s.opts.ConsulUtil.UnRegister()
 
-				s.Shutdown()
-				os.Exit(0)
-			case syscall.SIGUSR1:
-				// File log re-open for rotating file logs.
-				s.log.ReopenLogFile()
-			case syscall.SIGHUP:
-				// Ignore for now
-                //2018-06-13
-                s.log.Noticef("get signal:%v, will UnRegister()", sig)
-                s.opts.ConsulUtil.UnRegister()
+					s.Shutdown()
+					os.Exit(0)
+				case syscall.SIGTERM:
+					//2018-06-13
+					s.log.Noticef("get signal:%v, will UnRegister()", sig)
+					s.opts.ConsulUtil.UnRegister()
+
+					s.Shutdown()
+					os.Exit(143)
+				case syscall.SIGUSR1:
+					// File log re-open for rotating file logs.
+					s.log.ReopenLogFile()
+				case syscall.SIGHUP:
+					// Ignore for now
+					//2018-06-13
+					s.log.Noticef("get signal:%v, will UnRegister()", sig)
+					s.opts.ConsulUtil.UnRegister()
+				}
+			case <-s.shutdownCh:
+				return
 			}
 		}
 	}()

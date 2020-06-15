@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
+	"github.com/nats-io/stan.go/pb"
 )
 
 func getCryptoOverhead(s MsgStore) uint64 {
@@ -367,6 +367,7 @@ func TestCSMaxAge(t *testing.T) {
 			// Wait a bit
 			time.Sleep(300 * time.Millisecond)
 			// Send more
+			start := time.Now()
 			for i := 0; i < 5; i++ {
 				storeMsg(t, cs, "foo", seq, msg)
 				seq++
@@ -377,7 +378,11 @@ func TestCSMaxAge(t *testing.T) {
 			expectedFirst := uint64(11)
 			expectedLast := uint64(15)
 			first, last := msgStoreFirstAndLastSequence(t, cs.Msgs)
-			if first != expectedFirst || last != expectedLast {
+			// On travis, sometimes it gets delayed so much that
+			// by the time we check, all have expired.
+			if dur := time.Since(start); dur >= 350*time.Millisecond {
+				t.Logf("Skipping first/last check since %v passed since sending the 5 msgs", dur)
+			} else if first != expectedFirst || last != expectedLast {
 				t.Fatalf("Expected first/last to be %v/%v, got %v/%v",
 					expectedFirst, expectedLast, first, last)
 			}
@@ -443,7 +448,6 @@ func TestCSMaxAge(t *testing.T) {
 				}
 				// Store a message
 				storeMsg(t, cs, "bar", seq, []byte("msg"))
-				seq++
 				// Now timer should have been set again
 				if !isSet() {
 					t.Fatal("Timer should have been set")
@@ -485,6 +489,42 @@ func TestCSMaxAgeWithGapInSeq(t *testing.T) {
 			// They all should be gone.
 			if n, _ := msgStoreState(t, cs.Msgs); n != 0 {
 				t.Fatalf("All messages should have expired, got %v", n)
+			}
+		})
+	}
+}
+
+func TestCSMaxAgeForMsgsWithTimestampInPast(t *testing.T) {
+	for _, st := range testStores {
+		st := st
+		t.Run(st.name, func(t *testing.T) {
+			t.Parallel()
+			defer endTest(t, st)
+			s := startTest(t, st)
+			defer s.Close()
+
+			sl := testDefaultStoreLimits
+			sl.MaxAge = time.Minute
+			s.SetLimits(&sl)
+
+			cs := storeCreateChannel(t, s, "foo")
+			for seq := uint64(1); seq < 3; seq++ {
+				// Create a message with a timestamp in the past.
+				msg := &pb.MsgProto{
+					Sequence:  seq,
+					Subject:   "foo",
+					Data:      []byte("hello"),
+					Timestamp: time.Now().Add(-time.Hour).UnixNano(),
+				}
+				if _, err := cs.Msgs.Store(msg); err != nil {
+					t.Fatalf("Error storing message: %v", err)
+				}
+				// Wait a bit
+				time.Sleep(300 * time.Millisecond)
+				// Check that message has expired.
+				if first, err := cs.Msgs.FirstSequence(); err != nil || first != seq+1 {
+					t.Fatal("Message should have expired")
+				}
 			}
 		})
 	}

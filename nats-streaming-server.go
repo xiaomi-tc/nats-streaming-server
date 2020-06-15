@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,11 +21,12 @@ import (
 	"os"
 	"runtime"
 
-	natsd "github.com/nats-io/gnatsd/server"
+	natsd "github.com/nats-io/nats-server/v2/server"
 	stand "github.com/nats-io/nats-streaming-server/server"
 
-	_ "github.com/go-sql-driver/mysql" // mysql driver
-	_ "github.com/lib/pq"              // postgres driver
+	_ "github.com/go-sql-driver/mysql"                              // mysql driver
+	_ "github.com/lib/pq"                                           // postgres driver
+	_ "github.com/nats-io/nats-streaming-server/stores/pqdeadlines" // wrapper for postgres that gives read/write deadlines
 )
 
 var usageStr = `
@@ -50,7 +51,7 @@ Streaming Server Options:
     -sl,  --signal <signal>[=<pid>]      Send signal to nats-streaming-server process (stop, quit, reopen)
           --encrypt <bool>               Specify if server should use encryption at rest
           --encryption_cipher <string>   Cipher to use for encryption. Currently support AES and CHAHA (ChaChaPoly). Defaults to AES
-          --encryption_key <sting>       Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead
+          --encryption_key <string>      Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead
     
 Streaming Server Clustering Options:
     --clustered <bool>                   Run the server in a clustered configuration (default: false)
@@ -80,6 +81,8 @@ Streaming Server File Store Options:
     --file_fds_limit <int>               Store will try to use no more file descriptors than this given limit
     --file_parallel_recovery <int>       On startup, number of channels that can be recovered in parallel
     --file_truncate_bad_eof <bool>       Truncate files for which there is an unexpected EOF on recovery, dataloss may occur
+    --file_read_buffer_size <size>       Size of messages read ahead buffer (0 to disable)
+    --file_auto_sync <duration>          Interval at which the store should be automatically flushed and sync'ed on disk (<= 0 to disable)
 
 Streaming Server SQL Store Options:
     --sql_driver <string>            Name of the SQL Driver ("mysql" or "postgres")
